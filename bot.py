@@ -2,6 +2,7 @@ import hashlib
 import html
 import json
 import os
+import time
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -134,6 +135,7 @@ def main_keyboard() -> types.ReplyKeyboardMarkup:
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add("🎲 12 слов", "🎲 24 слова")
     markup.add("📝 Ввести mnemonic", "📜 История")
+    markup.add("🔄 Баланс последнего")
     return markup
 
 
@@ -145,16 +147,62 @@ def code(value: Any) -> str:
     return f"<code>{html.escape(str(value), quote=False)}</code>"
 
 
+def _balance_from_esplora_payload(data: dict[str, Any]) -> int:
+    chain = data.get("chain_stats") or {}
+    mempool = data.get("mempool_stats") or {}
+    confirmed = int(chain.get("funded_txo_sum") or 0) - int(chain.get("spent_txo_sum") or 0)
+    unconfirmed = int(mempool.get("funded_txo_sum") or 0) - int(mempool.get("spent_txo_sum") or 0)
+    return max(0, confirmed + unconfirmed)
+
+
 def get_balance(address: str) -> str:
-    try:
-        url = f"https://api.blockchair.com/bitcoin/dashboards/address/{address}"
-        r = requests.get(url, timeout=12)
-        if r.status_code == 200:
-            balance_sat = r.json().get("data", {}).get(address, {}).get("address", {}).get("balance", 0)
-            return f"{balance_sat / 100000000:.8f} BTC"
-        return f"не удалось получить баланс: HTTP {r.status_code}"
-    except Exception:
-        return "не удалось получить баланс"
+    headers = {
+        "User-Agent": "BTC-Wallet-Telegram-Bot/2.0",
+        "Accept": "application/json",
+    }
+    providers = [
+        ("Blockstream", f"https://blockstream.info/api/address/{address}", _balance_from_esplora_payload),
+        ("mempool.space", f"https://mempool.space/api/address/{address}", _balance_from_esplora_payload),
+    ]
+    errors: list[str] = []
+    for name, url, parser in providers:
+        try:
+            r = requests.get(url, timeout=15, headers=headers)
+            if r.status_code == 200:
+                sat = parser(r.json())
+                return f"{sat / 100000000:.8f} BTC"
+            if r.status_code in {429, 430, 503}:
+                errors.append(f"{name}: лимит/временно недоступно HTTP {r.status_code}")
+                time.sleep(0.7)
+            else:
+                errors.append(f"{name}: HTTP {r.status_code}")
+        except Exception as exc:
+            errors.append(f"{name}: {type(exc).__name__}")
+    return "не удалось получить баланс: " + "; ".join(errors[:2])
+
+
+def refresh_last_balance(chat_id: int) -> None:
+    chat_key = str(chat_id)
+    items = history.get(chat_key) or []
+    if not items:
+        bot.send_message(chat_id, "История пуста — сначала создай кошелёк.", reply_markup=main_keyboard())
+        return
+    last = items[-1]
+    address = str(last.get("address") or "")
+    if not address:
+        bot.send_message(chat_id, "В последней записи нет адреса.", reply_markup=main_keyboard())
+        return
+    balance = get_balance(address)
+    last["balance"] = balance
+    last["balance_checked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    save_history()
+    bot.send_message(
+        chat_id,
+        "🔄 <b>Баланс обновлён</b>\n\n"
+        f"🏠 Адрес:\n{code(address)}\n\n"
+        f"💰 Баланс: <b>{esc(balance)}</b>",
+        reply_markup=main_keyboard(),
+    )
 
 
 def normalize_mnemonic(text: str) -> str:
@@ -221,6 +269,9 @@ def handle(message):
 
     if text == "📜 История":
         return show_history(message.chat.id)
+
+    if text == "🔄 Баланс последнего":
+        return refresh_last_balance(message.chat.id)
 
     if text == "📝 Ввести mnemonic":
         return bot.send_message(
