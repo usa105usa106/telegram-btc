@@ -1,4 +1,8 @@
+.env
 __pycache__/
 *.pyc
 wallets_history.json
-.env
+wallets_history.json.tmp
+.venv/
+venv/
+.DS_Store
