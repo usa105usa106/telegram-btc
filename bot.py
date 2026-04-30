@@ -49,6 +49,7 @@ BALANCE_BATCH_WORKERS = max(1, min(32, int(os.getenv("BALANCE_BATCH_WORKERS", "1
 BALANCE_BATCH_SIZE = max(1, min(100, int(os.getenv("BALANCE_BATCH_SIZE", "100"))))
 BALANCE_REQUEST_TIMEOUT = max(1, min(30, int(os.getenv("BALANCE_REQUEST_TIMEOUT", "5"))))
 BLOCKCYPHER_TOKEN = os.getenv("BLOCKCYPHER_TOKEN", "").strip()
+BLOCKCHAIR_API_KEY = os.getenv("BLOCKCHAIR_API_KEY", "").strip()
 PIN_LEN = 5
 PIN_HASH_ITERATIONS = 240_000
 
@@ -604,11 +605,12 @@ def _balance_from_esplora_payload(data: dict[str, Any]) -> int:
     return max(0, confirmed + unconfirmed)
 
 
-def get_balance(address: str) -> str:
+def get_balance(address: str, request_timeout: int | None = None) -> str:
     headers = {
-        "User-Agent": "BTC-Wallet-Telegram-Bot/3.0",
+        "User-Agent": "BTC-Wallet-Telegram-Bot/3.4",
         "Accept": "application/json",
     }
+    timeout = max(1, min(30, int(request_timeout or BALANCE_REQUEST_TIMEOUT)))
     providers = [
         ("Blockstream", f"https://blockstream.info/api/address/{address}", _balance_from_esplora_payload),
         ("mempool.space", f"https://mempool.space/api/address/{address}", _balance_from_esplora_payload),
@@ -617,17 +619,17 @@ def get_balance(address: str) -> str:
     errors: list[str] = []
     for name, url, parser in providers:
         try:
-            r = requests.get(url, timeout=BALANCE_REQUEST_TIMEOUT, headers=headers)
+            r = requests.get(url, timeout=timeout, headers=headers)
             if r.status_code == 200:
                 data = r.json()
                 if name == "BlockCypher":
                     sat = int(data.get("balance") or 0) + int(data.get("unconfirmed_balance") or 0)
                 else:
                     sat = parser(data) if parser else 0
-                return f"{sat / 100000000:.8f} BTC"
+                return satoshi_to_btc_text(sat)
             if r.status_code in {429, 430, 503}:
                 errors.append(f"{name}: лимит/временно недоступно HTTP {r.status_code}")
-                time.sleep(0.7)
+                time.sleep(0.25)
             else:
                 errors.append(f"{name}: HTTP {r.status_code}")
         except Exception as exc:
@@ -1306,10 +1308,10 @@ def public_scan_milestones(total: int) -> set[int]:
     return {m for m in milestones if 0 < m <= total}
 
 
-def get_balance_safe_for_batch(address: str) -> str:
+def get_balance_safe_for_batch(address: str, request_timeout: int | None = None) -> str:
     # Отдельная обёртка нужна, чтобы ошибка одного адреса не останавливала весь пакет.
     try:
-        return get_balance(address)
+        return get_balance(address, request_timeout=request_timeout)
     except Exception as exc:
         return f"не удалось получить баланс: {type(exc).__name__}"
 
@@ -1322,66 +1324,170 @@ def satoshi_to_btc_text(sat: int) -> str:
     return f"{sat / 100000000:.8f} BTC"
 
 
-def get_balances_blockcypher_batch(addresses: list[str], *, request_timeout: int, fallback_workers: int) -> dict[str, str]:
+def _zero_balances(addresses: list[str]) -> dict[str, str]:
+    return {address: "0.00000000 BTC" for address in addresses}
+
+
+def get_balances_blockchair_batch(addresses: list[str], *, request_timeout: int) -> dict[str, str]:
     """
-    Максимально быстрый путь для public.txt: BlockCypher batch до 100 адресов
-    за один HTTP-запрос. Если batch недоступен или часть адресов не вернулась,
-    для таких адресов используется прежний fallback по одному адресу.
+    Самый быстрый путь для большого public.txt: Blockchair умеет принимать
+    большой список адресов за один запрос. В ответе обычно есть только адреса
+    с ненулевым подтверждённым балансом, поэтому отсутствующие адреса считаем 0.
+    """
+    if not addresses:
+        return {}
+
+    url = "https://api.blockchair.com/bitcoin/addresses/balances"
+    headers = {
+        "User-Agent": "BTC-Wallet-Telegram-Bot/3.4",
+        "Accept": "application/json",
+    }
+    params: dict[str, str] = {}
+    if BLOCKCHAIR_API_KEY:
+        params["key"] = BLOCKCHAIR_API_KEY
+
+    r = requests.post(
+        url,
+        data={"addresses": ",".join(addresses)},
+        params=params or None,
+        timeout=request_timeout,
+        headers=headers,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Blockchair HTTP {r.status_code}")
+
+    payload = r.json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        raise RuntimeError("Blockchair bad JSON")
+
+    result = _zero_balances(addresses)
+    for address, value in data.items():
+        if address not in result:
+            continue
+        try:
+            result[address] = satoshi_to_btc_text(int(value or 0))
+        except Exception:
+            result[address] = "не удалось получить баланс: bad Blockchair value"
+    return result
+
+
+def get_balances_blockchain_info_batch(addresses: list[str], *, request_timeout: int) -> dict[str, str]:
+    """Запасной batch-провайдер: blockchain.info/balance с active=addr|addr."""
+    if not addresses:
+        return {}
+
+    headers = {
+        "User-Agent": "BTC-Wallet-Telegram-Bot/3.4",
+        "Accept": "application/json",
+    }
+    r = requests.get(
+        "https://blockchain.info/balance",
+        params={"active": "|".join(addresses)},
+        timeout=request_timeout,
+        headers=headers,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Blockchain.info HTTP {r.status_code}")
+
+    payload = r.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Blockchain.info bad JSON")
+
+    result = _zero_balances(addresses)
+    for address in addresses:
+        row = payload.get(address)
+        if isinstance(row, dict):
+            try:
+                result[address] = satoshi_to_btc_text(int(row.get("final_balance") or 0))
+            except Exception:
+                result[address] = "не удалось получить баланс: bad Blockchain.info value"
+    return result
+
+
+def get_balances_blockcypher_batch(addresses: list[str], *, request_timeout: int) -> dict[str, str]:
+    """
+    Дополнительный batch-провайдер. Если часть адресов не вернулась в ответе,
+    они помечаются ошибкой, но проверка всего файла не зависает.
     """
     if not addresses:
         return {}
 
     headers = {
-        "User-Agent": "BTC-Wallet-Telegram-Bot/3.2",
+        "User-Agent": "BTC-Wallet-Telegram-Bot/3.4",
         "Accept": "application/json",
     }
     joined = ";".join(addresses)
     url = f"https://api.blockcypher.com/v1/btc/main/addrs/{joined}/balance"
     params = {"token": BLOCKCYPHER_TOKEN} if BLOCKCYPHER_TOKEN else None
 
-    try:
-        r = requests.get(url, timeout=request_timeout, headers=headers, params=params)
-        if r.status_code != 200:
-            raise RuntimeError(f"BlockCypher HTTP {r.status_code}")
+    r = requests.get(url, timeout=request_timeout, headers=headers, params=params)
+    if r.status_code != 200:
+        raise RuntimeError(f"BlockCypher HTTP {r.status_code}")
 
-        data = r.json()
-        if isinstance(data, dict):
-            rows = [data]
-        elif isinstance(data, list):
-            rows = data
-        else:
-            raise RuntimeError("BlockCypher bad JSON")
+    data = r.json()
+    if isinstance(data, dict):
+        rows = [data]
+    elif isinstance(data, list):
+        rows = data
+    else:
+        raise RuntimeError("BlockCypher bad JSON")
 
-        result: dict[str, str] = {}
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            address = str(row.get("address") or "").strip()
-            if not address:
-                continue
+    result: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        address = str(row.get("address") or "").strip()
+        if not address:
+            continue
+        try:
             final_balance = row.get("final_balance")
             if final_balance is None:
                 final_balance = int(row.get("balance") or 0) + int(row.get("unconfirmed_balance") or 0)
             result[address] = satoshi_to_btc_text(int(final_balance or 0))
+        except Exception:
+            result[address] = "не удалось получить баланс: bad BlockCypher value"
 
-        missing = [address for address in addresses if address not in result]
-        if missing:
-            with ThreadPoolExecutor(max_workers=min(fallback_workers, len(missing))) as fallback_executor:
-                future_to_address = {fallback_executor.submit(get_balance_safe_for_batch, address): address for address in missing}
-                for future in as_completed(future_to_address):
-                    result[future_to_address[future]] = future.result()
+    return {address: result.get(address, "не удалось получить баланс: empty BlockCypher result") for address in addresses}
 
-        return result
 
-    except Exception:
-        # При сбое batch-запроса проверяем chunk старым способом, чтобы бот не зависал и не падал.
-        result: dict[str, str] = {}
-        with ThreadPoolExecutor(max_workers=min(fallback_workers, len(addresses))) as fallback_executor:
-            future_to_address = {fallback_executor.submit(get_balance_safe_for_batch, address): address for address in addresses}
-            for future in as_completed(future_to_address):
-                result[future_to_address[future]] = future.result()
-        return result
+def get_balances_fast_batch(addresses: list[str], *, request_timeout: int, fallback_workers: int) -> dict[str, str]:
+    """
+    Быстрая проверка public.txt без обработки приватных ключей.
 
+    В предыдущей версии при сбое batch-запроса каждый chunk запускал
+    собственный fallback на 100+ потоков. На Railway это могло зависать,
+    поэтому счётчик оставался 0. Здесь сначала используются batch API,
+    затем ограниченный fallback без лавины вложенных потоков.
+    """
+    if not addresses:
+        return {}
+
+    errors: list[str] = []
+    for provider in (get_balances_blockchair_batch, get_balances_blockchain_info_batch, get_balances_blockcypher_batch):
+        try:
+            return provider(addresses, request_timeout=request_timeout)
+        except Exception as exc:
+            errors.append(f"{provider.__name__}: {type(exc).__name__}")
+
+    result: dict[str, str] = {}
+    safe_workers = max(1, min(8, int(fallback_workers), len(addresses)))
+    with ThreadPoolExecutor(max_workers=safe_workers) as fallback_executor:
+        future_to_address = {
+            fallback_executor.submit(get_balance_safe_for_batch, address, request_timeout): address
+            for address in addresses
+        }
+        for future in as_completed(future_to_address):
+            address = future_to_address[future]
+            try:
+                result[address] = future.result()
+            except Exception as exc:
+                result[address] = f"не удалось получить баланс: {type(exc).__name__}"
+
+    if not result:
+        joined_errors = "; ".join(errors[:3])
+        return {address: "не удалось получить баланс: " + joined_errors for address in addresses}
+    return result
 
 def scan_uploaded_address_file(
     chat_id: int,
@@ -1416,7 +1522,7 @@ def scan_uploaded_address_file(
     with ThreadPoolExecutor(max_workers=min(cfg["batch_workers"], len(chunks) or 1)) as executor:
         future_to_chunk = {
             executor.submit(
-                get_balances_blockcypher_batch,
+                get_balances_fast_batch,
                 [address for _index, address in chunk],
                 request_timeout=cfg["timeout"],
                 fallback_workers=cfg["fallback_workers"],
