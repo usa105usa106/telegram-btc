@@ -1,40 +1,55 @@
-# Bitcoin Wallet Bot — Railway repo
+# BTC Wallet Bot — same-word generators + PIN history
 
-## Деплой на Railway
+Railway-версия Telegram-бота для генерации Bitcoin P2PKH кошельков.
 
-1. Залей эти файлы в GitHub-репозиторий.
-2. В Railway создай новый проект из GitHub repo.
-3. В `Variables` добавь:
-   - `TELEGRAM_BOT_TOKEN` — токен от BotFather.
-   - Можно вместо него использовать `BOT_TOKEN`.
-4. Start command уже задан в `railway.json`: `python bot.py`.
-5. Для сохранения истории между redeploy/restart подключи Railway Volume, например на `/data`, и добавь `DATA_DIR=/data`.
+## Что добавлено
 
-## Важно
+- Обычные кнопки генерации: `🎲 12 слов`, `🎲 24 слова`.
+- Новые кнопки:
+  - `🎯 Рандом12 одинаковые` — бот выбирает 1 случайное слово из BIP39-списка 2048 слов и делает фразу из 12 одинаковых слов.
+  - `🎯 Рандом24 одинаковые` — аналогично, но 24 одинаковых слова.
+- История с PIN:
+  - `🔐 Установить PIN` или команда `/set_pin 12345`.
+  - PIN должен быть ровно 5 цифр.
+  - `📜 История` всегда просит PIN перед показом истории.
+  - После установки PIN новые записи истории сохраняют адрес, баланс, mnemonic, WIF и derivation path.
+- Баланс проверяется через Blockstream, mempool.space и BlockCypher.
 
-- Бот работает через Telegram long polling, поэтому открытый HTTP-порт не нужен.
-- Запускай только один инстанс бота с одним токеном, иначе Telegram polling будет конфликтовать.
-- История хранит только адрес и баланс. Seed/mnemonic/WIF на диск не сохраняются.
-- Повторения BIP39-слов разрешены. Если checksum неверный, бот покажет предупреждение, но адрес всё равно создаст из введённых слов.
+## Важно по безопасности
 
-## Локальный запуск
+Фразы из одинаковых слов крайне небезопасны. Не переводите реальные деньги на такие кошельки.
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-export TELEGRAM_BOT_TOKEN="123456:token"
-python bot.py
+PIN из 5 цифр защищает просмотр истории в Telegram. Секреты в файле истории шифруются Fernet-ключом, который хранится в `history_secret.key` или может быть задан через Railway Variable `HISTORY_SECRET_KEY`.
+
+Если потерять `history_secret.key` или `HISTORY_SECRET_KEY`, старые сохранённые WIF/mnemonic из истории расшифровать не получится.
+
+## Railway Variables
+
+Минимально:
+
+```env
+TELEGRAM_BOT_TOKEN=123456:ABCDEF
 ```
 
+Опционально:
 
-## Обновление v2: баланс
+```env
+DATA_DIR=/data
+HISTORY_SECRET_KEY=base64_fernet_key
+```
 
-- Blockchair заменён на несколько бесплатных Esplora-compatible API: Blockstream и mempool.space.
-- Добавлена кнопка `🔄 Баланс последнего`.
-- Если один провайдер отдаёт rate limit/HTTP 430, бот пробует следующий.
-- Приватные данные не сохраняются в историю на диске.
+Для постоянного хранения подключи Railway Volume и mount path `/data`.
 
-## Что не включено по безопасности
+## Запуск
 
-Автоматический мульти-генератор seed/WIF каждые 5 секунд и сохранение приватных ключей в историю не включены. Это превращает бота в инструмент массового перебора seed-фраз и небезопасного хранения приватных ключей.
+Railway использует:
+
+```bash
+worker: python bot.py
+```
+
+## Команды
+
+- `/start`
+- `/help`
+- `/set_pin 12345`

@@ -2,3 +2,5 @@ pyTelegramBotAPI==4.26.0
 mnemonic==0.21
 bip-utils==2.9.3
 requests==2.32.3
+
+cryptography==46.0.4

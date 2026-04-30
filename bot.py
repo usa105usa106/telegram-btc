@@ -1,7 +1,10 @@
+import base64
 import hashlib
+import hmac
 import html
 import json
 import os
+import secrets
 import time
 import unicodedata
 from datetime import datetime
@@ -13,6 +16,7 @@ import telebot
 from telebot import types
 from mnemonic import Mnemonic
 from bip_utils import Bip44, Bip44Changes, Bip44Coins
+from cryptography.fernet import Fernet, InvalidToken
 
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
@@ -24,9 +28,13 @@ if not TOKEN:
 DATA_DIR = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or os.getenv("DATA_DIR") or ".").resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 HISTORY_FILE = Path(os.getenv("HISTORY_FILE") or (DATA_DIR / "wallets_history.json"))
+PIN_FILE = Path(os.getenv("PIN_FILE") or (DATA_DIR / "history_pin.json"))
+SECRET_KEY_FILE = Path(os.getenv("SECRET_KEY_FILE") or (DATA_DIR / "history_secret.key"))
 
 DERIVATION_PATH = "m/44'/0'/0'/0/0"
-MAX_HISTORY_PER_CHAT = 20
+MAX_HISTORY_PER_CHAT = 50
+PIN_LEN = 5
+PIN_HASH_ITERATIONS = 240_000
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 mnemo = Mnemonic("english")
@@ -35,48 +43,104 @@ bip39_words = set(mnemo.wordlist)
 
 # ---------- storage ----------
 
-def load_history() -> dict[str, list[dict[str, Any]]]:
-    if not HISTORY_FILE.exists():
-        return {}
+def load_json_file(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
     try:
-        with HISTORY_FILE.open("r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        return data
     except Exception:
-        return {}
+        return default
+
+
+def save_json_file(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp.replace(path)
+
+
+def load_history() -> dict[str, list[dict[str, Any]]]:
+    data = load_json_file(HISTORY_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def load_pin_data() -> dict[str, dict[str, str]]:
+    data = load_json_file(PIN_FILE, {})
+    return data if isinstance(data, dict) else {}
 
 
 history: dict[str, list[dict[str, Any]]] = load_history()
+pin_data: dict[str, dict[str, str]] = load_pin_data()
 
 
 def save_history() -> None:
-    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = HISTORY_FILE.with_suffix(HISTORY_FILE.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
-    tmp.replace(HISTORY_FILE)
+    save_json_file(HISTORY_FILE, history)
 
 
-def sanitize_history() -> None:
-    """Не храним приватные данные на диске."""
-    changed = False
-    for chat_id, items in list(history.items()):
-        if not isinstance(items, list):
-            history[chat_id] = []
-            changed = True
-            continue
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            for secret_key in ("mnemonic", "wif", "private_key", "seed"):
-                if secret_key in item:
-                    item.pop(secret_key, None)
-                    changed = True
-    if changed:
-        save_history()
+def save_pin_data() -> None:
+    save_json_file(PIN_FILE, pin_data)
 
 
-sanitize_history()
+def get_master_fernet() -> Fernet:
+    env_key = os.getenv("HISTORY_SECRET_KEY", "").strip()
+    if env_key:
+        return Fernet(env_key.encode("utf-8"))
+    if SECRET_KEY_FILE.exists():
+        key = SECRET_KEY_FILE.read_text(encoding="utf-8").strip()
+        return Fernet(key.encode("utf-8"))
+    key = Fernet.generate_key()
+    SECRET_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SECRET_KEY_FILE.write_text(key.decode("utf-8"), encoding="utf-8")
+    return Fernet(key)
+
+
+def encrypt_json(data: dict[str, Any]) -> str:
+    raw = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return get_master_fernet().encrypt(raw).decode("utf-8")
+
+
+def decrypt_json(token: str) -> dict[str, Any]:
+    raw = get_master_fernet().decrypt(str(token).encode("utf-8"))
+    data = json.loads(raw.decode("utf-8"))
+    return data if isinstance(data, dict) else {}
+
+
+def pin_is_valid_format(pin: str) -> bool:
+    return bool(pin) and pin.isdigit() and len(pin) == PIN_LEN
+
+
+def pin_hash(pin: str, salt_b64: str) -> str:
+    salt = base64.b64decode(salt_b64.encode("ascii"))
+    digest = hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt, PIN_HASH_ITERATIONS)
+    return base64.b64encode(digest).decode("ascii")
+
+
+def set_chat_pin(chat_id: int, pin: str) -> None:
+    salt_b64 = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+    pin_data[str(chat_id)] = {
+        "salt": salt_b64,
+        "hash": pin_hash(pin, salt_b64),
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    save_pin_data()
+
+
+def chat_has_pin(chat_id: int) -> bool:
+    rec = pin_data.get(str(chat_id))
+    return isinstance(rec, dict) and bool(rec.get("salt") and rec.get("hash"))
+
+
+def verify_chat_pin(chat_id: int, pin: str) -> bool:
+    rec = pin_data.get(str(chat_id)) or {}
+    salt = rec.get("salt")
+    expected = rec.get("hash")
+    if not salt or not expected or not pin_is_valid_format(pin):
+        return False
+    actual = pin_hash(pin, salt)
+    return hmac.compare_digest(actual, expected)
 
 
 # ---------- bitcoin helpers ----------
@@ -129,13 +193,19 @@ def derive_bitcoin_wallet(mnemonic_phrase: str) -> Tuple[str, str]:
     return address, wif
 
 
+def same_word_mnemonic(word_count: int) -> str:
+    word = secrets.choice(mnemo.wordlist)
+    return " ".join([word] * word_count)
+
+
 # ---------- bot ui ----------
 
 def main_keyboard() -> types.ReplyKeyboardMarkup:
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add("🎲 12 слов", "🎲 24 слова")
+    markup.add("🎯 Рандом12 одинаковые", "🎯 Рандом24 одинаковые")
     markup.add("📝 Ввести mnemonic", "📜 История")
-    markup.add("🔄 Баланс последнего")
+    markup.add("🔐 Установить PIN", "🔄 Баланс последнего")
     return markup
 
 
@@ -157,19 +227,24 @@ def _balance_from_esplora_payload(data: dict[str, Any]) -> int:
 
 def get_balance(address: str) -> str:
     headers = {
-        "User-Agent": "BTC-Wallet-Telegram-Bot/2.0",
+        "User-Agent": "BTC-Wallet-Telegram-Bot/3.0",
         "Accept": "application/json",
     }
     providers = [
         ("Blockstream", f"https://blockstream.info/api/address/{address}", _balance_from_esplora_payload),
         ("mempool.space", f"https://mempool.space/api/address/{address}", _balance_from_esplora_payload),
+        ("BlockCypher", f"https://api.blockcypher.com/v1/btc/main/addrs/{address}/balance", None),
     ]
     errors: list[str] = []
     for name, url, parser in providers:
         try:
             r = requests.get(url, timeout=15, headers=headers)
             if r.status_code == 200:
-                sat = parser(r.json())
+                data = r.json()
+                if name == "BlockCypher":
+                    sat = int(data.get("balance") or 0) + int(data.get("unconfirmed_balance") or 0)
+                else:
+                    sat = parser(data) if parser else 0
                 return f"{sat / 100000000:.8f} BTC"
             if r.status_code in {429, 430, 503}:
                 errors.append(f"{name}: лимит/временно недоступно HTTP {r.status_code}")
@@ -178,7 +253,7 @@ def get_balance(address: str) -> str:
                 errors.append(f"{name}: HTTP {r.status_code}")
         except Exception as exc:
             errors.append(f"{name}: {type(exc).__name__}")
-    return "не удалось получить баланс: " + "; ".join(errors[:2])
+    return "не удалось получить баланс: " + "; ".join(errors[:3])
 
 
 def refresh_last_balance(chat_id: int) -> None:
@@ -225,15 +300,66 @@ def validate_mnemonic_words(mnemonic_phrase: str) -> Tuple[bool, str, bool]:
     return True, "", checksum_ok
 
 
+# ---------- PIN handlers ----------
+
+@bot.message_handler(commands=["set_pin"])
+def set_pin_cmd(message):
+    parts = (message.text or "").strip().split(maxsplit=1)
+    if len(parts) != 2:
+        bot.send_message(
+            message.chat.id,
+            "🔐 Отправь PIN командой:\n<code>/set_pin 12345</code>\n\nPIN должен быть ровно 5 цифр.",
+            reply_markup=main_keyboard(),
+        )
+        return
+    pin = parts[1].strip()
+    if not pin_is_valid_format(pin):
+        bot.send_message(message.chat.id, "❌ PIN должен быть ровно 5 цифр.", reply_markup=main_keyboard())
+        return
+    set_chat_pin(message.chat.id, pin)
+    bot.send_message(
+        message.chat.id,
+        "✅ PIN установлен. Теперь новые кошельки будут сохраняться в историю вместе со словами/WIF.\n\n"
+        "⚠️ 5 цифр — слабая защита. Не храни там кошельки с деньгами.",
+        reply_markup=main_keyboard(),
+    )
+
+
+def ask_set_pin(message) -> None:
+    bot.send_message(
+        message.chat.id,
+        "🔐 Для истории с ключами задай PIN из 5 цифр:\n<code>/set_pin 12345</code>\n\n"
+        "После установки PIN бот будет сохранять в историю: слова, адрес, WIF, баланс.",
+        reply_markup=main_keyboard(),
+    )
+
+
+def request_history_pin(message) -> None:
+    if not chat_has_pin(message.chat.id):
+        return ask_set_pin(message)
+    sent = bot.send_message(message.chat.id, "🔐 Введи PIN-код из 5 цифр для просмотра истории:")
+    bot.register_next_step_handler(sent, show_history_after_pin)
+
+
+def show_history_after_pin(message) -> None:
+    pin = (message.text or "").strip()
+    if not verify_chat_pin(message.chat.id, pin):
+        bot.send_message(message.chat.id, "❌ Неверный PIN.", reply_markup=main_keyboard())
+        return
+    show_history(message.chat.id, include_secrets=True)
+
+
+# ---------- telegram handlers ----------
+
 @bot.message_handler(commands=["start"])
 def start(message):
     bot.send_message(
         message.chat.id,
         "👋 <b>Bitcoin Wallet Bot</b>\n\n"
-        "✅ Railway-версия готова.\n"
-        "✅ Генерация 12/24 слов работает через long polling.\n"
-        "✅ Повторения BIP39-слов разрешены. Если checksum неверный — бот покажет предупреждение, но всё равно создаст адрес.\n\n"
-        "⚠️ Не вводи seed-фразы от кошельков, где уже есть деньги.",
+        "✅ Генерация обычных 12/24 слов.\n"
+        "✅ Рандом12/Рандом24 из одного случайного BIP39-слова.\n"
+        "✅ История с ключами открывается только по PIN из 5 цифр.\n\n"
+        "⚠️ Фразы из одинаковых слов небезопасны и подходят только для тестов/экспериментов.",
         reply_markup=main_keyboard(),
     )
 
@@ -245,8 +371,12 @@ def help_cmd(message):
         "<b>Команды:</b>\n"
         "• 🎲 12 слов — создать новую 12-word фразу\n"
         "• 🎲 24 слова — создать новую 24-word фразу\n"
-        "• 📝 Ввести mnemonic — проверить/импортировать фразу\n"
-        "• 📜 История — последние адреса без приватных ключей\n\n"
+        "• 🎯 Рандом12 одинаковые — одно случайное BIP39-слово ×12\n"
+        "• 🎯 Рандом24 одинаковые — одно случайное BIP39-слово ×24\n"
+        "• 🔐 Установить PIN — включить историю с ключами\n"
+        "• 📜 История — запросит PIN и покажет кошельки/ключи/баланс\n"
+        "• 🔄 Баланс последнего — обновить баланс последней записи\n"
+        "• /set_pin 12345 — задать PIN из 5 цифр\n\n"
         f"Путь деривации: {code(DERIVATION_PATH)}\n"
         f"Файл истории: {code(HISTORY_FILE)}",
         reply_markup=main_keyboard(),
@@ -261,14 +391,25 @@ def handle(message):
 
     if text in {"🎲 12 слов", "🎲 Случайный 12", "12 слов"}:
         mnemonic_phrase = mnemo.generate(strength=128)
-        return process_mnemonic(message.chat.id, mnemonic_phrase, True)
+        return process_mnemonic(message.chat.id, mnemonic_phrase, True, source_type="Random 12")
 
     if text in {"🎲 24 слова", "🎲 Случайный 24", "24 слова"}:
         mnemonic_phrase = mnemo.generate(strength=256)
-        return process_mnemonic(message.chat.id, mnemonic_phrase, True)
+        return process_mnemonic(message.chat.id, mnemonic_phrase, True, source_type="Random 24")
+
+    if text in {"🎯 Рандом12 одинаковые", "рандом12", "random12"}:
+        mnemonic_phrase = same_word_mnemonic(12)
+        return process_mnemonic(message.chat.id, mnemonic_phrase, True, source_type="SameWord 12")
+
+    if text in {"🎯 Рандом24 одинаковые", "рандом24", "random24"}:
+        mnemonic_phrase = same_word_mnemonic(24)
+        return process_mnemonic(message.chat.id, mnemonic_phrase, True, source_type="SameWord 24")
 
     if text == "📜 История":
-        return show_history(message.chat.id)
+        return request_history_pin(message)
+
+    if text == "🔐 Установить PIN":
+        return ask_set_pin(message)
 
     if text == "🔄 Баланс последнего":
         return refresh_last_balance(message.chat.id)
@@ -286,10 +427,10 @@ def handle(message):
     if not ok:
         return bot.reply_to(message, error_text, reply_markup=main_keyboard())
 
-    return process_mnemonic(message.chat.id, mnemonic_phrase, False, checksum_ok=checksum_ok)
+    return process_mnemonic(message.chat.id, mnemonic_phrase, False, checksum_ok=checksum_ok, source_type="Custom")
 
 
-def process_mnemonic(chat_id: int, mnemonic_phrase: str, is_random: bool, checksum_ok: bool | None = None):
+def process_mnemonic(chat_id: int, mnemonic_phrase: str, is_random: bool, checksum_ok: bool | None = None, source_type: str | None = None):
     try:
         if checksum_ok is None:
             checksum_ok = mnemo.check(mnemonic_phrase)
@@ -298,17 +439,31 @@ def process_mnemonic(chat_id: int, mnemonic_phrase: str, is_random: bool, checks
 
         chat_key = str(chat_id)
         history.setdefault(chat_key, [])
-        history[chat_key].append({
+        record: dict[str, Any] = {
             "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "type": "Random" if is_random else "Custom",
+            "type": source_type or ("Random" if is_random else "Custom"),
             "address": address,
             "balance": balance,
             "checksum_ok": bool(checksum_ok),
-        })
+        }
+        secrets_saved = False
+        if chat_has_pin(chat_id):
+            record["secret"] = encrypt_json({
+                "mnemonic": mnemonic_phrase,
+                "wif": wif,
+                "derivation_path": DERIVATION_PATH,
+            })
+            secrets_saved = True
+        history[chat_key].append(record)
         history[chat_key] = history[chat_key][-MAX_HISTORY_PER_CHAT:]
         save_history()
 
         checksum_line = "✅ BIP39 checksum: OK" if checksum_ok else "⚠️ BIP39 checksum: неверный, но адрес создан из введённых слов"
+        save_line = (
+            "🔐 История: слова/WIF сохранены, просмотр только по PIN."
+            if secrets_saved
+            else "⚠️ PIN не установлен — в историю сохранены только адрес и баланс. Нажми 🔐 Установить PIN."
+        )
         bot.send_message(
             chat_id,
             "✅ <b>Кошелёк создан!</b>\n\n"
@@ -318,30 +473,43 @@ def process_mnemonic(chat_id: int, mnemonic_phrase: str, is_random: bool, checks
             f"📍 Derivation path: {code(DERIVATION_PATH)}\n"
             f"{esc(checksum_line)}\n"
             f"💰 Баланс: <b>{esc(balance)}</b>\n\n"
-            "⚠️ Сохрани слова и WIF сам. В историю бот записывает только адрес и баланс.",
+            f"{esc(save_line)}\n"
+            "⚠️ Фразы из одинаковых слов крайне небезопасны. Не пополняй такие кошельки.",
             reply_markup=main_keyboard(),
         )
     except Exception as e:
         bot.send_message(chat_id, f"❌ Ошибка создания: {code(str(e))}", reply_markup=main_keyboard())
 
 
-def show_history(chat_id: int):
+def show_history(chat_id: int, include_secrets: bool = False):
     items = history.get(str(chat_id)) or []
     if not items:
         return bot.send_message(chat_id, "История пуста.", reply_markup=main_keyboard())
 
     lines = ["📜 <b>Последние кошельки:</b>", ""]
-    for w in reversed(items[-5:]):
+    for index, w in enumerate(reversed(items[-10:]), start=1):
         checksum = "OK" if w.get("checksum_ok", True) else "WARN"
-        lines.append(f"{esc(w.get('date', '?'))} | {esc(w.get('type', '?'))} | checksum {checksum}")
-        lines.append(f"{code(w.get('address', '?'))} | {esc(w.get('balance', '?'))}")
+        lines.append(f"<b>#{index}</b> {esc(w.get('date', '?'))} | {esc(w.get('type', '?'))} | checksum {checksum}")
+        lines.append(f"🏠 {code(w.get('address', '?'))}")
+        lines.append(f"💰 {esc(w.get('balance', '?'))}")
+        if include_secrets:
+            token = w.get("secret")
+            if token:
+                try:
+                    secret_data = decrypt_json(str(token))
+                    lines.append(f"📝 {code(secret_data.get('mnemonic', '?'))}")
+                    lines.append(f"🔑 WIF: {code(secret_data.get('wif', '?'))}")
+                    lines.append(f"📍 {code(secret_data.get('derivation_path', DERIVATION_PATH))}")
+                except (InvalidToken, Exception):
+                    lines.append("⚠️ Ключи не удалось расшифровать.")
+            else:
+                lines.append("⚠️ В этой старой записи ключи не сохранены: PIN тогда не был установлен.")
         lines.append("")
     bot.send_message(chat_id, "\n".join(lines), reply_markup=main_keyboard())
 
 
 if __name__ == "__main__":
     print(f"🤖 Бот запущен. History: {HISTORY_FILE}", flush=True)
-    # Важно для Railway long polling: убрать старый webhook и не обрабатывать старые pending updates.
     try:
         bot.remove_webhook()
     except Exception:
