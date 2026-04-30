@@ -4,7 +4,6 @@ import json
 import logging
 import math
 import os
-import re
 import time
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
@@ -20,50 +19,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_VERSION = "ETH/BTC AutoTrade AI v1.0.2-token-fix"
-
-
-def clean_env_secret(value: str | None) -> str:
-    value = str(value or "").strip()
-    # Railway иногда копируют со случайными кавычками/пробелами.
-    value = value.strip('\"').strip("'").strip()
-    return value
-
-
-def first_env_value(*names: str) -> str:
-    for name in names:
-        value = clean_env_secret(os.getenv(name))
-        if value:
-            return value
-    return ""
-
-
-BOT_TOKEN = first_env_value(
-    "BOT_TOKEN",
-    "TELEGRAM_BOT_TOKEN",
-    "TELEGRAM_TOKEN",
-    "TG_BOT_TOKEN",
-    "TOKEN",
-    "BOT_API_TOKEN",
-    "TELEGRAM_API_TOKEN",
-)
-def parse_id_set(raw: str) -> set[int]:
-    result: set[int] = set()
-    raw = str(raw or "").replace("[", " ").replace("]", " ").replace("'", " ").replace('"', " ")
-    for item in re.split(r"[,;\s]+", raw):
-        item = item.strip()
-        if item.lstrip("-").isdigit():
-            result.add(int(item))
-    return result
-
-
-ADMIN_IDS = parse_id_set(
-    os.getenv("ADMIN_IDS", "")
-    or os.getenv("ADMIN_ID", "")
-    or os.getenv("TELEGRAM_ADMIN_IDS", "")
-    or os.getenv("TELEGRAM_ADMIN_ID", "")
-)
-ADMIN_REQUIRED = os.getenv("ADMIN_REQUIRED", "true").strip().lower() not in {"0", "false", "no", "off"}
+BOT_VERSION = "ETH/BTC AutoTrade AI v1.0.0"
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or ""
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.lstrip("-").isdigit()}
 DATA_DIR = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or os.getenv("DATA_DIR") or "data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_FILE = DATA_DIR / "settings.json"
@@ -141,7 +99,6 @@ main_keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text="🧪 PAPER"), KeyboardButton(text="🛑 OFF")],
         [KeyboardButton(text="🤖 AI/обучение"), KeyboardButton(text="📈 Бэктест")],
         [KeyboardButton(text="🔑 API"), KeyboardButton(text="⚙️ Настройки")],
-        [KeyboardButton(text="🆔 Мой ID")],
     ],
     resize_keyboard=True,
 )
@@ -195,8 +152,6 @@ def load_state() -> dict[str, Any]:
     state.setdefault("last_signal_ts", {})
     state.setdefault("daily", {})
     state.setdefault("live_armed", False)
-    if "admin_ids" not in state:
-        state["admin_ids"] = sorted(ADMIN_IDS)
     return state
 
 
@@ -208,34 +163,13 @@ def today_key() -> str:
     return time.strftime("%Y-%m-%d", time.gmtime())
 
 
-def get_user_id(message_or_user_id: Any) -> Optional[int]:
-    if isinstance(message_or_user_id, int):
-        return message_or_user_id
-    return getattr(getattr(message_or_user_id, "from_user", None), "id", None)
-
-
 def is_admin(message_or_user_id: Any) -> bool:
-    if not ADMIN_REQUIRED:
-        return True
-    uid = get_user_id(message_or_user_id)
-    if not uid:
-        return False
-    if uid in ADMIN_IDS:
-        return True
-    try:
-        state_admins = set(int(x) for x in load_state().get("admin_ids", []) if str(x).lstrip("-").isdigit())
-        return uid in state_admins
-    except Exception:
-        return False
+    if isinstance(message_or_user_id, int):
+        uid = message_or_user_id
+    else:
+        uid = getattr(getattr(message_or_user_id, "from_user", None), "id", None)
+    return bool(uid and uid in ADMIN_IDS)
 
-
-def admin_hint() -> str:
-    if not ADMIN_REQUIRED:
-        return "Админ-проверка отключена: ADMIN_REQUIRED=false."
-    ids = sorted(set(ADMIN_IDS) | set(int(x) for x in load_state().get("admin_ids", []) if str(x).lstrip("-").isdigit()))
-    if ids:
-        return "Админы: " + ", ".join(str(x) for x in ids)
-    return "Админ не задан. Первый пользователь, который нажмёт /start, станет админом."
 
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
@@ -1153,42 +1087,12 @@ async def cmd_start(message: Message) -> None:
     subs = set(int(x) for x in state.get("subscribers", []))
     subs.add(message.chat.id)
     state["subscribers"] = sorted(subs)
-    promoted = False
-    # Если ADMIN_IDS в Railway не задан, первый пользователь автоматически становится админом.
-    if ADMIN_REQUIRED and not ADMIN_IDS and not state.get("admin_ids") and message.from_user:
-        state["admin_ids"] = [int(message.from_user.id)]
-        promoted = True
     save_state(state)
-    extra = "\n\n✅ Ты назначен админом этого бота." if promoted else ""
     await message.answer(
         "Готов. Это ETH/BTC бот для сигналов и авто-торговли. По умолчанию безопасный PAPER режим.\n\n"
-        "Команды: /status /settings /scan /backtest /api /api_set /mode /trade_mode /risk /leverage /arm_live /disarm_live /myid"
-        f"{extra}",
+        "Команды: /status /settings /scan /backtest /api /api_set /mode /trade_mode /risk /leverage /arm_live /disarm_live",
         reply_markup=main_keyboard,
     )
-
-@dp.message(Command("myid", "id"))
-async def cmd_myid(message: Message) -> None:
-    uid = message.from_user.id if message.from_user else 0
-    await message.answer(
-        f"Твой Telegram ID: <code>{uid}</code>\n"
-        f"ADMIN_IDS из ENV: <code>{html.escape(','.join(str(x) for x in sorted(ADMIN_IDS)) or 'не задан')}</code>\n"
-        f"{html.escape(admin_hint())}"
-    )
-
-@dp.message(Command("add_admin"))
-async def cmd_add_admin(message: Message, command: CommandObject) -> None:
-    if not is_admin(message):
-        return await message.answer("Только админ. Нажми /myid и добавь этот ID в Railway Variables → ADMIN_IDS, либо поставь ADMIN_REQUIRED=false.")
-    raw = (command.args or "").strip()
-    if not raw.lstrip("-").isdigit():
-        return await message.answer("Формат: <code>/add_admin 123456789</code>")
-    state = load_state()
-    admins = set(int(x) for x in state.get("admin_ids", []) if str(x).lstrip("-").isdigit())
-    admins.add(int(raw))
-    state["admin_ids"] = sorted(admins)
-    save_state(state)
-    await message.answer(f"✅ Добавил админа: <code>{html.escape(raw)}</code>")
 
 @dp.message(Command("status"))
 async def cmd_status(message: Message) -> None:
@@ -1197,13 +1101,13 @@ async def cmd_status(message: Message) -> None:
 @dp.message(Command("settings"))
 async def cmd_settings(message: Message) -> None:
     if not is_admin(message):
-        return await message.answer("Только админ. Нажми /myid и добавь этот ID в Railway Variables → ADMIN_IDS, либо поставь ADMIN_REQUIRED=false.")
+        return await message.answer("Только админ.")
     await message.answer(status_text(load_settings(), load_state()), reply_markup=settings_keyboard(load_settings()))
 
 @dp.message(Command("scan"))
 async def cmd_scan(message: Message) -> None:
     if not is_admin(message):
-        return await message.answer("Только админ. Нажми /myid и добавь этот ID в Railway Variables → ADMIN_IDS, либо поставь ADMIN_REQUIRED=false.")
+        return await message.answer("Только админ.")
     progress = await message.answer("🔎 Сканирую BTC/ETH...")
     await run_scan(message.chat.id)
     try:
@@ -1214,7 +1118,7 @@ async def cmd_scan(message: Message) -> None:
 @dp.message(Command("backtest"))
 async def cmd_backtest(message: Message) -> None:
     if not is_admin(message):
-        return await message.answer("Только админ. Нажми /myid и добавь этот ID в Railway Variables → ADMIN_IDS, либо поставь ADMIN_REQUIRED=false.")
+        return await message.answer("Только админ.")
     progress = await message.answer("📈 Загружаю свечи и гоняю бэктест...")
     try:
         text = await run_backtest_text()
@@ -1226,7 +1130,7 @@ async def cmd_backtest(message: Message) -> None:
 @dp.message(Command("mode"))
 async def cmd_mode(message: Message, command: CommandObject) -> None:
     if not is_admin(message):
-        return await message.answer("Только админ. Нажми /myid и добавь этот ID в Railway Variables → ADMIN_IDS, либо поставь ADMIN_REQUIRED=false.")
+        return await message.answer("Только админ.")
     value = (command.args or "").strip().lower()
     if value not in MODE_PROFILES:
         return await message.answer("Используй: /mode scalp или /mode swing")
@@ -1236,7 +1140,7 @@ async def cmd_mode(message: Message, command: CommandObject) -> None:
 @dp.message(Command("trade_mode"))
 async def cmd_trade_mode(message: Message, command: CommandObject) -> None:
     if not is_admin(message):
-        return await message.answer("Только админ. Нажми /myid и добавь этот ID в Railway Variables → ADMIN_IDS, либо поставь ADMIN_REQUIRED=false.")
+        return await message.answer("Только админ.")
     value = (command.args or "").strip().lower()
     if value not in {"off", "paper", "live"}:
         return await message.answer("Используй: /trade_mode off|paper|live")
@@ -1246,7 +1150,7 @@ async def cmd_trade_mode(message: Message, command: CommandObject) -> None:
 @dp.message(Command("risk"))
 async def cmd_risk(message: Message, command: CommandObject) -> None:
     if not is_admin(message):
-        return await message.answer("Только админ. Нажми /myid и добавь этот ID в Railway Variables → ADMIN_IDS, либо поставь ADMIN_REQUIRED=false.")
+        return await message.answer("Только админ.")
     try:
         value = clamp(float(command.args or ""), 0.05, 2.0)
     except Exception:
@@ -1257,7 +1161,7 @@ async def cmd_risk(message: Message, command: CommandObject) -> None:
 @dp.message(Command("leverage"))
 async def cmd_leverage(message: Message, command: CommandObject) -> None:
     if not is_admin(message):
-        return await message.answer("Только админ. Нажми /myid и добавь этот ID в Railway Variables → ADMIN_IDS, либо поставь ADMIN_REQUIRED=false.")
+        return await message.answer("Только админ.")
     try:
         value = int(clamp(int(command.args or ""), 1, 10))
     except Exception:
@@ -1268,7 +1172,7 @@ async def cmd_leverage(message: Message, command: CommandObject) -> None:
 @dp.message(Command("api"))
 async def cmd_api(message: Message) -> None:
     if not is_admin(message):
-        return await message.answer("Только админ. Нажми /myid и добавь этот ID в Railway Variables → ADMIN_IDS, либо поставь ADMIN_REQUIRED=false.")
+        return await message.answer("Только админ.")
     settings = load_settings()
     keys = load_api_keys().get(settings["exchange_id"], {})
     env_ok = bool(os.getenv("EXCHANGE_API_KEY") and os.getenv("EXCHANGE_API_SECRET"))
@@ -1287,7 +1191,7 @@ async def cmd_api(message: Message) -> None:
 @dp.message(Command("api_set"))
 async def cmd_api_set(message: Message, command: CommandObject) -> None:
     if not is_admin(message):
-        return await message.answer("Только админ. Нажми /myid и добавь этот ID в Railway Variables → ADMIN_IDS, либо поставь ADMIN_REQUIRED=false.")
+        return await message.answer("Только админ.")
     parts = (command.args or "").split()
     if len(parts) < 3:
         return await message.answer("Формат: /api_set mexc KEY SECRET [PASSWORD]")
@@ -1307,28 +1211,28 @@ async def cmd_api_set(message: Message, command: CommandObject) -> None:
 @dp.message(Command("api_clear"))
 async def cmd_api_clear(message: Message) -> None:
     if not is_admin(message):
-        return await message.answer("Только админ. Нажми /myid и добавь этот ID в Railway Variables → ADMIN_IDS, либо поставь ADMIN_REQUIRED=false.")
+        return await message.answer("Только админ.")
     settings = load_settings(); data = load_api_keys(); data.pop(settings["exchange_id"], None); save_api_keys(data)
     await message.answer("API ключи текущей биржи очищены.")
 
 @dp.message(Command("arm_live"))
 async def cmd_arm_live(message: Message) -> None:
     if not is_admin(message):
-        return await message.answer("Только админ. Нажми /myid и добавь этот ID в Railway Variables → ADMIN_IDS, либо поставь ADMIN_REQUIRED=false.")
+        return await message.answer("Только админ.")
     state = load_state(); state["live_armed"] = True; save_state(state)
     await message.answer("🔴 LIVE ARMED. Реальные сделки разрешены, если /trade_mode live и автовход ON.")
 
 @dp.message(Command("disarm_live"))
 async def cmd_disarm_live(message: Message) -> None:
     if not is_admin(message):
-        return await message.answer("Только админ. Нажми /myid и добавь этот ID в Railway Variables → ADMIN_IDS, либо поставь ADMIN_REQUIRED=false.")
+        return await message.answer("Только админ.")
     state = load_state(); state["live_armed"] = False; save_state(state)
     await message.answer("🧯 LIVE disarmed. Реальные сделки заблокированы.")
 
 @dp.callback_query(F.data.startswith("set:") | F.data.startswith("toggle:") | F.data.startswith("run:"))
 async def callbacks(callback: CallbackQuery) -> None:
-    if callback.from_user is None or not is_admin(callback.from_user.id):
-        return await callback.answer("Только админ. Нажми /myid и добавь ID в ADMIN_IDS.", show_alert=True)
+    if callback.from_user is None or callback.from_user.id not in ADMIN_IDS:
+        return await callback.answer("Только админ", show_alert=True)
     settings = load_settings(); state = load_state(); data = callback.data or ""
     if data == "set:mode:scalp":
         settings["strategy_mode"] = "scalp"; save_settings(settings); await callback.answer("Scalp")
@@ -1354,9 +1258,6 @@ async def callbacks(callback: CallbackQuery) -> None:
             text = await run_backtest_text(); await callback.message.answer(text)
     if callback.message and data not in {"run:scan", "run:backtest"}:
         await callback.message.edit_text(status_text(load_settings(), load_state()), reply_markup=settings_keyboard(load_settings()))
-
-@dp.message(F.text == "🆔 Мой ID")
-async def btn_myid(message: Message) -> None: await cmd_myid(message)
 
 @dp.message(F.text == "📊 Статус")
 async def btn_status(message: Message) -> None: await cmd_status(message)
@@ -1405,7 +1306,7 @@ async def trading_loop() -> None:
 async def main() -> None:
     global bot
     if not BOT_TOKEN:
-        raise RuntimeError("Не задан токен Telegram-бота. В Railway → Variables добавь BOT_TOKEN=токен_из_BotFather или TELEGRAM_BOT_TOKEN=токен_из_BotFather. Поддерживаются также TELEGRAM_TOKEN, TG_BOT_TOKEN, TOKEN.")
+        raise RuntimeError("BOT_TOKEN / TELEGRAM_BOT_TOKEN не задан")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     settings = load_settings(); save_settings(settings)
     state = load_state(); save_state(state)

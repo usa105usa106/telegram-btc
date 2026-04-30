@@ -1,8 +1,5 @@
 .env
+/data
 __pycache__/
 *.pyc
-wallets_history.json
-wallets_history.json.tmp
-.venv/
-venv/
-.DS_Store
+*.log
