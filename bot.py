@@ -6,7 +6,7 @@ from datetime import datetime
 import requests
 from mnemonic import Mnemonic
 from hdwallet import HDWallet
-from hdwallet.cryptocurrencies import Bitcoin as BTC  # ← переименовали
+from hdwallet.cryptocurrencies import Bitcoin
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
@@ -43,7 +43,10 @@ def start(message):
     markup.add("🎲 12 слов", "🎲 24 слова")
     markup.add("📝 Ввести mnemonic", "📜 История")
     bot.send_message(message.chat.id,
-        "👋 Bitcoin Wallet Bot\n\n✅ Работает на Railway\n⚠️ Никому не показывай приватные ключи!",
+        "👋 Bitcoin Wallet Bot\n\n"
+        "✅ Только слова из BIP39 (2048)\n"
+        "✅ Повторения разрешены\n"
+        "⚠️ Никому не показывай приватные ключи!",
         reply_markup=markup)
 
 def generate_random_mnemonic(strength=128):
@@ -61,23 +64,27 @@ def handle(message):
     elif text == "📜 История":
         show_history(message.chat.id)
     elif text == "📝 Ввести mnemonic":
-        bot.send_message(message.chat.id, "Отправь 12 или 24 слова через пробел:")
+        bot.send_message(message.chat.id, "Отправь 12 или 24 слова из BIP39 (повторения разрешены):")
     else:
         words = text.split()
         if len(words) not in (12, 24):
             bot.reply_to(message, "❌ Должно быть ровно 12 или 24 слова!")
             return
+        
         mnemonic = " ".join(words)
+        
+        # Проверка: все слова должны быть из BIP39, но повторения разрешены
         if not mnemo.check(mnemonic):
-            bot.reply_to(message, "❌ Некоторые слова не из BIP39!")
+            bot.reply_to(message, "❌ Некоторые слова не из BIP39 (2048 слов)!\n"
+                                  "Используй только слова из официального списка.")
             return
+        
         process_mnemonic(message.chat.id, mnemonic, False)
 
 def process_mnemonic(chat_id, mnemonic, is_random):
     try:
-        # Исправленная инициализация
-        wallet = HDWallet(cryptocurrency=BTC)
-        wallet.from_mnemonic(mnemonic=mnemonic)
+        wallet = HDWallet(cryptocurrency=Bitcoin)
+        wallet.from_mnemonic(mnemonic)
         
         address = wallet.p2pkh_address()
         wif = wallet.wif()
@@ -102,7 +109,7 @@ def process_mnemonic(chat_id, mnemonic, is_random):
 📝 Mnemonic ({len(mnemonic.split())} слов):
 `{mnemonic}`
 
-🏠 Адрес (P2PKH):
+🏠 Адрес:
 `{address}`
 
 🔑 WIF Private Key:
@@ -122,5 +129,5 @@ def show_history(chat_id):
         text += f"{item['date']} — {item['type']}\n`{item['address']}` — {item['balance']}\n\n"
     bot.send_message(chat_id, text, parse_mode="Markdown")
 
-print("🤖 Бот успешно запущен...")
+print("🤖 Бот запущен (BIP39 + повторения разрешены)")
 bot.infinity_polling()
