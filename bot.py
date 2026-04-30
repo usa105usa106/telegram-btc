@@ -6,7 +6,7 @@ from datetime import datetime
 import requests
 from mnemonic import Mnemonic
 from hdwallet import HDWallet
-from hdwallet.cryptocurrencies import Bitcoin  # ← Класс Bitcoin
+from hdwallet.cryptocurrencies import Bitcoin as BTC  # ← переименовали
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
@@ -75,8 +75,8 @@ def handle(message):
 
 def process_mnemonic(chat_id, mnemonic, is_random):
     try:
-        # Правильная инициализация для новой версии hdwallet
-        wallet = HDWallet(cryptocurrency=Bitcoin)
+        # Исправленная инициализация
+        wallet = HDWallet(cryptocurrency=BTC)
         wallet.from_mnemonic(mnemonic=mnemonic)
         
         address = wallet.p2pkh_address()
@@ -97,19 +97,19 @@ def process_mnemonic(chat_id, mnemonic, is_random):
         save_history()
 
         bot.send_message(chat_id, f"""
-✅ Кошелёк создан!
+✅ Кошелёк успешно создан!
 
-📝 Mnemonic:
+📝 Mnemonic ({len(mnemonic.split())} слов):
 `{mnemonic}`
 
-🏠 Address:
+🏠 Адрес (P2PKH):
 `{address}`
 
 🔑 WIF Private Key:
 `{wif}`
 
 💰 Баланс: {balance}
-""", parse_mode="Markdown")
+        """, parse_mode="Markdown")
     except Exception as e:
         bot.send_message(chat_id, f"❌ Ошибка: {str(e)}")
 
