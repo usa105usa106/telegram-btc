@@ -6,6 +6,7 @@ from datetime import datetime
 import requests
 from mnemonic import Mnemonic
 from hdwallet import HDWallet
+from hdwallet.cryptocurrencies import Bitcoin  # ← Важно!
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
@@ -46,7 +47,6 @@ def start(message):
         reply_markup=markup)
 
 def generate_random_mnemonic(strength=128):
-    """Генерируем mnemonic через библиотеку mnemonic"""
     return mnemo.generate(strength=strength)
 
 @bot.message_handler(func=lambda m: True)
@@ -75,8 +75,10 @@ def handle(message):
 
 def process_mnemonic(chat_id, mnemonic, is_random):
     try:
-        wallet = HDWallet(symbol="BTC")
-        wallet.from_mnemonic(mnemonic)
+        # Новый способ инициализации
+        wallet = HDWallet(cryptocurrency=Bitcoin)
+        wallet.from_mnemonic(mnemonic=mnemonic)
+        
         address = wallet.p2pkh_address()
         wif = wallet.wif()
         balance = get_balance(address)
@@ -103,13 +105,13 @@ def process_mnemonic(chat_id, mnemonic, is_random):
 🏠 Address:
 `{address}`
 
-🔑 WIF:
+🔑 WIF Private Key:
 `{wif}`
 
 💰 Баланс: {balance}
 """, parse_mode="Markdown")
     except Exception as e:
-        bot.send_message(chat_id, f"❌ Ошибка: {e}")
+        bot.send_message(chat_id, f"❌ Ошибка: {str(e)}")
 
 def show_history(chat_id):
     if str(chat_id) not in history or not history[str(chat_id)]:
