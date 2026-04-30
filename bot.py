@@ -504,7 +504,6 @@ def main_keyboard(chat_id: int | None = None) -> types.ReplyKeyboardMarkup:
     markup.add("🔐 Установить PIN", "🔄 Баланс последнего")
     markup.add("📋 Копировать всё", "📤 Проверить public.txt")
     markup.add("⚡ Настройки public.txt")
-    markup.add("🏓 Ping", "♻️ Рестарт")
     if chat_id is not None and is_private_key_mode_enabled(chat_id):
         markup.add("🔑 Приват ключ: ВКЛ")
     else:
@@ -517,6 +516,8 @@ def main_keyboard(chat_id: int | None = None) -> types.ReplyKeyboardMarkup:
         markup.add("⚙️ Пакет: ВКЛ")
     else:
         markup.add("⚙️ Пакет: ВЫКЛ")
+    # Служебные кнопки всегда в самом низу клавиатуры.
+    markup.add("🏓 Ping", "♻️ Рестарт")
     return markup
 
 
@@ -616,19 +617,28 @@ def is_restart_allowed(chat_id: int) -> bool:
 
 
 def send_ping(chat_id: int) -> None:
+    """Проверяет задержку Bot API без редактирования сообщения.
+
+    В прошлой версии ping отправлял сообщение, а затем сразу редактировал его.
+    У Telegram editMessageText иногда возвращает ApiTelegramException на быстрых
+    повторных нажатиях или при нестабильной сети. Теперь ping измеряется через
+    отдельный быстрый запрос get_me(), а результат отправляется обычным
+    сообщением — так кнопка не падает с ApiTelegramException.
+    """
     started = time.perf_counter()
     try:
-        msg = bot.send_message(chat_id, "🏓 Проверяю ping...", reply_markup=main_keyboard(chat_id))
+        bot.get_me()
         ping_ms = int((time.perf_counter() - started) * 1000)
-        bot.edit_message_text(
-            f"🏓 <b>Ping:</b> {ping_ms} ms\n🔢 <b>Версия:</b> {BOT_VERSION}",
-            chat_id=chat_id,
-            message_id=msg.message_id,
-        )
-    except Exception as exc:
         bot.send_message(
             chat_id,
-            f"🏓 Ping: ошибка проверки: {code(type(exc).__name__)}\n🔢 Версия: <b>{BOT_VERSION}</b>",
+            f"🏓 <b>Ping:</b> {ping_ms} ms\n🔢 <b>Версия:</b> {BOT_VERSION}",
+            reply_markup=main_keyboard(chat_id),
+        )
+    except Exception as exc:
+        # Даже если Bot API недоступен для get_me(), показываем версию и понятную ошибку.
+        bot.send_message(
+            chat_id,
+            f"🏓 <b>Ping:</b> ошибка проверки: {code(type(exc).__name__)}\n🔢 <b>Версия:</b> {BOT_VERSION}",
             reply_markup=main_keyboard(chat_id),
         )
 
