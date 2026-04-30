@@ -13,6 +13,8 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 import requests
 import telebot
@@ -40,6 +42,9 @@ MAX_HISTORY_PER_CHAT = 30000
 BATCH_WALLET_COUNT = 10000
 TELEGRAM_COPY_CHUNK_SIZE = 3600
 MAX_UPLOAD_FILE_BYTES = 1_000_000
+# Ускорение безопасной проверки работает только для загруженных/введённых публичных адресов.
+BALANCE_SCAN_WORKERS = max(1, min(32, int(os.getenv("BALANCE_SCAN_WORKERS", "12"))))
+BALANCE_REQUEST_TIMEOUT = max(3, min(30, int(os.getenv("BALANCE_REQUEST_TIMEOUT", "8"))))
 PIN_LEN = 5
 PIN_HASH_ITERATIONS = 240_000
 
@@ -453,7 +458,7 @@ def get_balance(address: str) -> str:
     errors: list[str] = []
     for name, url, parser in providers:
         try:
-            r = requests.get(url, timeout=15, headers=headers)
+            r = requests.get(url, timeout=BALANCE_REQUEST_TIMEOUT, headers=headers)
             if r.status_code == 200:
                 data = r.json()
                 if name == "BlockCypher":
@@ -624,7 +629,7 @@ def process_batch_private_keys(chat_id: int) -> None:
         "📋 Нажми «Копировать всё», чтобы получить два TXT-файла: public.txt и private.txt.\n"
         "• public.txt — публичные адреса, по одному в строке.\n"
         "• private.txt — WIF-ключи, по одному в строке.\n"
-        "💰 При создании public.txt через «Копировать всё» бот сразу запустит автопроверку баланса по публичным адресам.",
+        "ℹ️ Автопроверка не запускается для public.txt, который создан вместе с private.txt/WIF.",
         reply_markup=main_keyboard(chat_id),
     )
 
@@ -657,7 +662,7 @@ def process_batch_wallets(chat_id: int, source_type: str) -> None:
         f"✅ <b>Пакет создан:</b> {BATCH_WALLET_COUNT} кошельков.\n\n"
         f"Тип: <b>{esc(source_type)}</b>\n"
         f"🔐 Слова/WIF сохранены в историю и открываются только по PIN.\n"
-        "💰 После создания public.txt через «Копировать всё» бот автоматически проверит баланс по публичным адресам.\n"
+        "ℹ️ Проверка баланса запускается только по отдельно загруженному TXT/CSV с публичными адресами.\n"
         f"📋 Нажми «Копировать всё», чтобы получить два TXT-файла по последним {BATCH_WALLET_COUNT} кошелькам: public.txt и private.txt.\n"
         "📤 Проверка идёт только по публичным адресам из public.txt, без обработки private.txt/WIF/seed.\n\n"
         f"Первый адрес:\n{code(first_address)}\n\n"
@@ -723,7 +728,7 @@ def send_export_all(chat_id: int) -> None:
         caption=(
             f"📄 public.txt готов: {export_count} публичных адресов.\n"
             "Формат: один публичный BTC-адрес в строке.\n"
-            "🔎 Автопроверка баланса по этому public.txt запускается сразу после отправки файлов."
+            "ℹ️ Проверка баланса не запускается автоматически для файла, созданного вместе с private.txt/WIF."
         ),
     )
     bot.send_document(
@@ -737,19 +742,12 @@ def send_export_all(chat_id: int) -> None:
         ),
     )
 
-    if public_addresses:
-        scan_uploaded_address_file(
-            chat_id,
-            public_addresses,
-            source_name="созданного public.txt",
-            record_type="Auto public.txt scan",
-        )
-    else:
-        bot.send_message(
-            chat_id,
-            "⚠️ public.txt создан, но публичные адреса для автопроверки не распознаны.",
-            reply_markup=main_keyboard(chat_id),
-        )
+    bot.send_message(
+        chat_id,
+        "✅ Файлы созданы. Автопроверка баланса не запускается для public.txt, который был создан вместе с private.txt/WIF.\n"
+        "Для безопасной проверки загрузи отдельный TXT/CSV только с публичными адресами через «📤 Проверить public.txt».",
+        reply_markup=main_keyboard(chat_id),
+    )
 
 def request_export_all_pin(message) -> None:
     if not chat_has_pin(message.chat.id):
@@ -864,7 +862,7 @@ def start(message):
         "✅ PIN вводится один раз за сессию: история и экспорт больше не спрашивают его после разблокировки.\n"
         "✅ Кнопка 🔑 Приват ключ ВКЛ/ВЫКЛ включает режим генерации/экспорта только WIF.\n"
         f"✅ Кнопка 📋 Копировать всё отправляет два TXT-файла по последним {BATCH_WALLET_COUNT} записям: public.txt и private.txt.\n"
-        "✅ Новый public.txt автоматически проверяется на баланс сразу после создания; проверка идёт без обработки private.txt/WIF/seed.\n"
+        "✅ Отдельно загруженный public.txt проверяется на баланс в ускоренном режиме без обработки private.txt/WIF/seed.\n"
         "✅ Загруженный TXT со списком публичных адресов тоже проверяется на положительный баланс без обработки приватных ключей.\n\n"
         "⚠️ Фразы из одинаковых слов небезопасны и подходят только для тестов/экспериментов.",
         reply_markup=main_keyboard(message.chat.id),
@@ -884,9 +882,9 @@ def help_cmd(message):
         "• 📜 История — запросит PIN и покажет кошельки/ключи/баланс\n"
         "• 🔄 Баланс последнего — обновить баланс последней записи\n"
         "• 💰 Положительный баланс — временный RAM-список найденных адресов с балансом > 0\n"
-        f"• ⚙️ Пакет: ВКЛ/ВЫКЛ — когда включено, 🎲 12/24 слова и 🎯 Рандом12/24 одинаковые создают сразу {BATCH_WALLET_COUNT} кошельков; автопроверка запускается при создании public.txt через «Копировать всё»\n"
+        f"• ⚙️ Пакет: ВКЛ/ВЫКЛ — когда включено, 🎲 12/24 слова и 🎯 Рандом12/24 одинаковые создают сразу {BATCH_WALLET_COUNT} кошельков; проверка баланса доступна только для отдельно загруженного public.txt/CSV без private.txt/WIF\n"
         "• 🔑 Приват ключ ВКЛ/ВЫКЛ — в режиме ВКЛ новые генерации создают random private key → WIF без вывода seed-фраз\n"
-        f"• 📋 Копировать всё — после PIN отправить public.txt и private.txt по последним {BATCH_WALLET_COUNT} ключам; номера строк совпадают; public.txt сразу проверяется на баланс\n"
+        f"• 📋 Копировать всё — после PIN отправить public.txt и private.txt по последним {BATCH_WALLET_COUNT} ключам; номера строк совпадают\n"
         "• 📤 Проверить public.txt — инструкция по загрузке файла public.txt; проверяются только публичные адреса, файлы с приватными ключами не принимаются\n"
         f"• /scan10000 seed words — проверить первые {BATCH_WALLET_COUNT} адресов из твоей seed-фразы (/scan1000 и /scan100 тоже работают)\n"
         "• /set_pin 12345 — задать PIN из 5 цифр\n\n"
@@ -1113,6 +1111,30 @@ def contains_private_wallet_data(text: str) -> bool:
     # Это убирает ложные срабатывания на обычных публичных адресах/публичных ключах.
     return bool(parse_wifs_from_text(text))
 
+
+def public_scan_progress_text(checked: int, total: int, positive_count: int, chat_id: int) -> str:
+    return (
+        f"🔎 Проверено {checked}/{total} адресов…\n"
+        f"💰 Положительный баланс: <b>{positive_count}</b>\n"
+        f"📊 Всего проверено в этой сессии: <b>{checked_counter(chat_id)}</b>"
+    )
+
+
+def public_scan_milestones(total: int) -> set[int]:
+    milestones = {total}
+    if total > 5000:
+        milestones.add(5000)
+    return {m for m in milestones if 0 < m <= total}
+
+
+def get_balance_safe_for_batch(address: str) -> str:
+    # Отдельная обёртка нужна, чтобы ошибка одного адреса не останавливала весь пакет.
+    try:
+        return get_balance(address)
+    except Exception as exc:
+        return f"не удалось получить баланс: {type(exc).__name__}"
+
+
 def scan_uploaded_address_file(
     chat_id: int,
     addresses: list[str],
@@ -1120,38 +1142,69 @@ def scan_uploaded_address_file(
     source_name: str = "TXT",
     record_type: str = "Address file scan",
 ) -> None:
+    """Быстрая проверка только публичных адресов/публичных ключей из загруженного файла."""
+    total = len(addresses)
     bot.send_message(
         chat_id,
-        f"🔎 Начинаю проверку адресов из {esc(source_name)}: {len(addresses)} шт.\n"
+        f"🔎 Начинаю ускоренную проверку адресов из {esc(source_name)}: {total} шт.\n"
+        f"Потоков проверки: <b>{BALANCE_SCAN_WORKERS}</b>.\n"
         "Проверяются только публичные адреса; приватные ключи не сохраняются и не обрабатываются.",
         reply_markup=main_keyboard(chat_id),
     )
 
     positive_records: list[dict[str, Any]] = []
     api_errors = 0
-    for index, address in enumerate(addresses, start=1):
-        balance = get_balance(address)
-        increment_checked_counter(chat_id)
-        if str(balance).startswith("не удалось"):
-            api_errors += 1
-        if parse_balance_btc(balance) > 0:
-            record: dict[str, Any] = {
-                "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "type": record_type,
-                "address": address,
-                "balance": balance,
-                "derivation_path": f"address-only {source_name}",
-                "index": index,
-            }
-            positive_records.append(record)
-            remember_positive_wallet(chat_id, record)
-        if index % 100 == 0 and index < len(addresses):
-            bot.send_message(
-                chat_id,
-                f"🔎 Проверено {index}/{len(addresses)} адресов…\n"
-                f"📊 Всего проверено в этой сессии: {checked_counter(chat_id)}",
-            )
-        time.sleep(0.2)
+    checked = 0
+    milestones = public_scan_milestones(total)
+
+    with ThreadPoolExecutor(max_workers=BALANCE_SCAN_WORKERS) as executor:
+        future_to_address = {
+            executor.submit(get_balance_safe_for_batch, address): (index, address)
+            for index, address in enumerate(addresses, start=1)
+        }
+        for future in as_completed(future_to_address):
+            original_index, address = future_to_address[future]
+            balance = future.result()
+            checked += 1
+            increment_checked_counter(chat_id)
+
+            if str(balance).startswith("не удалось"):
+                api_errors += 1
+
+            if parse_balance_btc(balance) > 0:
+                record: dict[str, Any] = {
+                    "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "type": record_type,
+                    "address": address,
+                    "balance": balance,
+                    "derivation_path": f"address-only {source_name}",
+                    "index": original_index,
+                }
+                positive_records.append(record)
+                remember_positive_wallet(chat_id, record)
+                bot.send_message(
+                    chat_id,
+                    "💰 <b>Положительный баланс найден</b>\n"
+                    f"🏠 {code(address)}\n"
+                    f"💰 <b>{esc(balance)}</b>\n"
+                    f"🔎 Проверено сейчас: {checked}/{total}",
+                    reply_markup=main_keyboard(chat_id),
+                )
+
+            if checked in milestones:
+                bot.send_message(
+                    chat_id,
+                    public_scan_progress_text(checked, total, len(positive_records), chat_id),
+                    reply_markup=main_keyboard(chat_id),
+                )
+
+    # На случай, если из-за гонки/исключения финальный milestone не отправился.
+    if checked not in milestones:
+        bot.send_message(
+            chat_id,
+            public_scan_progress_text(checked, total, len(positive_records), chat_id),
+            reply_markup=main_keyboard(chat_id),
+        )
 
     if positive_records:
         # Сохраняем только публичные адреса и баланс; приватные ключи/WIF из файла не принимаются и не сохраняются.
@@ -1159,7 +1212,7 @@ def scan_uploaded_address_file(
         lines = [
             "BTC Wallet Bot — адреса с положительным балансом",
             f"Дата проверки: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"Проверено адресов: {len(addresses)}",
+            f"Проверено адресов: {total}",
             f"Найдено с балансом > 0: {len(positive_records)}",
             "",
         ]
@@ -1178,9 +1231,9 @@ def scan_uploaded_address_file(
         extra = "" if len(positive_records) <= 10 else f"\n…и ещё {len(positive_records) - 10}."
         bot.send_message(
             chat_id,
-            f"✅ Проверено адресов: {len(addresses)}.\n"
+            f"✅ Проверено адресов: {total}.\n"
             f"📊 Всего проверено в этой сессии: <b>{checked_counter(chat_id)}</b>.\n"
-            f"💰 Найдено с балансом > 0: <b>{len(positive_records)}</b>.\n"
+            f"💰 Положительный баланс: <b>{len(positive_records)}</b>.\n"
             "Список добавлен в RAM-кнопку «Положительный баланс» до перезапуска бота.\n"
             "Положительные адреса сохранены в историю без приватных ключей.\n\n"
             + "\n\n".join(shown) + extra,
@@ -1191,9 +1244,9 @@ def scan_uploaded_address_file(
         err_line = f"\n⚠️ Ошибки API при проверке: {api_errors}." if api_errors else ""
         bot.send_message(
             chat_id,
-            f"✅ Проверено адресов: {len(addresses)}.\n"
+            f"✅ Проверено адресов: {total}.\n"
             f"📊 Всего проверено в этой сессии: <b>{checked_counter(chat_id)}</b>.\n"
-            "💰 Адресов с балансом > 0 не найдено."
+            "💰 Положительный баланс: <b>0</b>."
             f"{err_line}",
             reply_markup=main_keyboard(chat_id),
         )
@@ -1315,7 +1368,7 @@ def handle(message):
         return bot.send_message(
             message.chat.id,
             "📤 Загрузи сюда файл public.txt или CSV/TXT со списком публичных BTC-адресов, по одному адресу в строке.\n\n"
-            f"Бот проверит до {BATCH_WALLET_COUNT} публичных адресов, покажет адреса с балансом > 0 и сохранит их в историю без приватных ключей. "
+            f"Бот в ускоренном режиме проверит до {BATCH_WALLET_COUNT} публичных адресов, покажет прогресс на 5000/{BATCH_WALLET_COUNT} и {BATCH_WALLET_COUNT}/{BATCH_WALLET_COUNT}, а адреса с балансом > 0 покажет сразу в чате и сохранит в историю без приватных ключей. "
             "Файлы private.txt/WIF/seed для проверки не принимаются. Если в TXT лежат HEX public-key, бот сконвертирует их в legacy P2PKH-адреса и проверит баланс.",
             reply_markup=main_keyboard(message.chat.id),
         )
