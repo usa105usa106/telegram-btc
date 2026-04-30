@@ -23,6 +23,9 @@ else:
 
 mnemo = Mnemonic("english")
 
+# Получаем список всех 2048 слов
+bip39_words = set(mnemo.wordlist)
+
 def get_balance(address: str) -> str:
     try:
         r = requests.get(f"https://api.blockchair.com/bitcoin/dashboards/address/{address}?limit=0", timeout=10)
@@ -71,14 +74,14 @@ def handle(message):
             bot.reply_to(message, "❌ Должно быть ровно 12 или 24 слова!")
             return
         
-        mnemonic = " ".join(words)
-        
-        # Проверка: все слова должны быть из BIP39, но повторения разрешены
-        if not mnemo.check(mnemonic):
-            bot.reply_to(message, "❌ Некоторые слова не из BIP39 (2048 слов)!\n"
-                                  "Используй только слова из официального списка.")
+        # Проверка каждого слова по отдельности (повторения разрешены)
+        invalid = [w for w in words if w not in bip39_words]
+        if invalid:
+            bot.reply_to(message, f"❌ Некоторые слова не из BIP39 (2048 слов)!\n"
+                                  f"Неверные: {invalid[:5]}...")
             return
         
+        mnemonic = " ".join(words)
         process_mnemonic(message.chat.id, mnemonic, False)
 
 def process_mnemonic(chat_id, mnemonic, is_random):
