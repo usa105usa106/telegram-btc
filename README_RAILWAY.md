@@ -1,129 +1,71 @@
-# ETH/BTC AutoTrade AI Telegram Bot
+# BTC Wallet Bot — same-word generators + PIN history
 
-Telegram bot for BTC/ETH futures signals and optional auto-trading.
+Railway-версия Telegram-бота для генерации Bitcoin P2PKH кошельков.
 
-**Important:** this bot cannot guarantee profit. Crypto futures are high-risk. Start with PAPER mode and small risk. LIVE mode is locked behind `/arm_live`.
+## Что добавлено
 
-## Features
+- Обычные кнопки генерации: `🎲 12 слов`, `🎲 24 слова`.
+- Новые кнопки:
+  - `🎯 Рандом12 одинаковые` — бот выбирает 1 случайное слово из BIP39-списка 2048 слов и делает фразу из 12 одинаковых слов.
+  - `🎯 Рандом24 одинаковые` — аналогично, но 24 одинаковых слова.
+- История с PIN:
+  - `🔐 Установить PIN` или команда `/set_pin 12345`.
+  - PIN должен быть ровно 5 цифр.
+  - `📜 История` всегда просит PIN перед показом истории.
+  - После установки PIN новые записи истории сохраняют адрес, баланс, mnemonic, WIF и derivation path.
+- Баланс проверяется через Blockstream, mempool.space и BlockCypher.
 
-- BTC/ETH only.
-- Two strategy profiles:
-  - **Scalp**: 5m base + 15m/1h confirmations, up to 10 trades/hour.
-  - **Swing**: 1h base + 4h/1d confirmations, 1–2 trades/day.
-- Multi-factor scoring: EMA trend, RSI, MACD momentum, ATR volatility, volume, slope, Bollinger z-score, multi-timeframe confirmation, funding-rate penalty.
-- Online self-learning model: separate logistic profiles for symbol/mode/side; learns from closed TP/SL results.
-- Modes: OFF, PAPER, LIVE.
-- LIVE safety gate: `/arm_live` required before real orders.
-- Position sizing by risk percent, daily loss limit, cooldowns, per-hour/per-day trade limits.
-- Exchange access through CCXT: MEXC, BingX, Bybit, Binance.
-- Telegram API settings via `/api_set`, or safer via Railway Variables.
-- `/backtest` runs a simplified backtest on recent exchange candles.
+## Важно по безопасности
 
-## Railway deploy
+Фразы из одинаковых слов крайне небезопасны. Не переводите реальные деньги на такие кошельки.
 
-1. Create Telegram bot with BotFather.
-2. Create Railway project from this repository.
-3. Add variables:
+PIN из 5 цифр защищает просмотр истории в Telegram. Секреты в файле истории шифруются Fernet-ключом, который хранится в `history_secret.key` или может быть задан через Railway Variable `HISTORY_SECRET_KEY`.
 
-```env
-BOT_TOKEN=123456:telegram-token
-ADMIN_IDS=123456789
-```
+Если потерять `history_secret.key` или `HISTORY_SECRET_KEY`, старые сохранённые WIF/mnemonic из истории расшифровать не получится.
 
-Optional API variables, safer than sending keys in chat:
+## Railway Variables
+
+Минимально:
 
 ```env
-EXCHANGE_ID=mexc
-EXCHANGE_API_KEY=...
-EXCHANGE_API_SECRET=...
-EXCHANGE_API_PASSWORD=
+TELEGRAM_BOT_TOKEN=123456:ABCDEF
 ```
 
-4. Add a Railway Volume if you want persistent settings/model/trade history.
-5. Deploy. Start command is in `railway.json` and `Procfile`.
-
-## First launch
-
-In Telegram:
-
-```text
-/start
-/status
-/backtest
-/scan
-```
-
-Switch modes:
-
-```text
-/mode scalp
-/mode swing
-/trade_mode paper
-/risk 0.35
-/leverage 2
-```
-
-Enable/disable auto entries in `/settings` using the inline button.
-
-## LIVE mode
-
-LIVE is intentionally hard to enable:
-
-```text
-/api_set mexc KEY SECRET
-/trade_mode live
-/arm_live
-```
-
-Then turn on autotrade in `/settings`.
-
-To lock LIVE again:
-
-```text
-/disarm_live
-/trade_mode off
-```
-
-## Notes
-
-- CCXT exchange support differs by exchange. Protective orders are best-effort and also monitored locally by the bot loop.
-- Keep one polling instance per bot token. Do not run multiple Railway replicas with the same Telegram token.
-- Backtest is simplified and does not prove future profitability.
-
-
-## Если пишет «Только админ»
-
-1. В Telegram отправь боту `/myid`.
-2. Скопируй число из строки `Твой Telegram ID`.
-3. В Railway Variables добавь или исправь:
+Опционально:
 
 ```env
-ADMIN_IDS=твой_id_без_пробелов
+DATA_DIR=/data
+HISTORY_SECRET_KEY=base64_fernet_key
 ```
 
-Поддерживаются также `ADMIN_ID`, `TELEGRAM_ADMIN_IDS`, `TELEGRAM_ADMIN_ID`, а разделители могут быть запятая, пробел или новая строка.
+Для постоянного хранения подключи Railway Volume и mount path `/data`.
 
-Если `ADMIN_IDS` не задан, первый пользователь, который нажмёт `/start`, автоматически станет админом и ID сохранится в `state.json`.
+## Запуск
 
-Полностью отключить проверку админа можно так:
+Railway использует:
 
-```env
-ADMIN_REQUIRED=false
+```bash
+worker: python bot.py
 ```
 
-Для LIVE-торговли лучше не отключать проверку админа.
+## Команды
+
+- `/start`
+- `/help`
+- `/set_pin 12345`
 
 
-## Важно: токен Telegram
+## Пакетный режим
 
-Если Railway Logs пишет `BOT_TOKEN / TELEGRAM_BOT_TOKEN не задан` или `Не задан токен Telegram-бота`, значит в сервисе не добавлена переменная с токеном от @BotFather.
+В этой версии добавлена кнопка `⚙️ Пакет: ВКЛ/ВЫКЛ`.
 
-В Railway открой **Service → Variables** и добавь ровно одну из переменных:
+- Когда режим выключен, кнопки `🎲 12 слов` и `🎲 24 слова` создают по одному кошельку, как раньше.
+- Когда режим включён, кнопки `🎲 12 слов` и `🎲 24 слова` создают сразу 1000 новых кошельков.
+- Для пакетного режима нужен PIN: мнемоники и WIF сохраняются в зашифрованную историю и открываются через `📜 История`.
+- Автоматическая проверка баланса в пакетном режиме отключена; баланс можно обновить вручную через `🔄 Баланс последнего`.
+- Настройки режима хранятся в `wallets_settings.json` рядом с историей.
 
-```env
-BOT_TOKEN=1234567890:AA...
-```
+## Копирование последних 1000 кошельков
 
-Также бот принимает алиасы: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_TOKEN`, `TG_BOT_TOKEN`, `TOKEN`.
+Кнопка `📋 Копировать всё` запрашивает PIN и отправляет последние 1000 кошельков прямо сообщениями в Telegram. Из-за лимита длины сообщения экспорт разбивается на несколько частей.
 
-После добавления переменной нажми **Redeploy** или перезапусти сервис.
