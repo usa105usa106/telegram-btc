@@ -6,11 +6,10 @@ from datetime import datetime
 import requests
 from mnemonic import Mnemonic
 from hdwallet import HDWallet
-from hdwallet.utils import generate_mnemonic
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
-    raise ValueError("❌ TELEGRAM_BOT_TOKEN не установлен в переменных Railway!")
+    raise ValueError("❌ TELEGRAM_BOT_TOKEN не установлен!")
 
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "wallets_history.json"
@@ -43,17 +42,21 @@ def start(message):
     markup.add("🎲 12 слов", "🎲 24 слова")
     markup.add("📝 Ввести mnemonic", "📜 История")
     bot.send_message(message.chat.id,
-        "👋 Bitcoin Wallet Bot\n\nРаботает 24/7 на Railway\n⚠️ Никому не показывай приватные ключи!",
+        "👋 Bitcoin Wallet Bot\n\n✅ Работает на Railway\n⚠️ Никому не показывай приватные ключи!",
         reply_markup=markup)
+
+def generate_random_mnemonic(strength=128):
+    """Генерируем mnemonic через библиотеку mnemonic"""
+    return mnemo.generate(strength=strength)
 
 @bot.message_handler(func=lambda m: True)
 def handle(message):
     text = message.text.strip()
     if text in ["🎲 12 слов", "🎲 Случайный 12"]:
-        mnemonic = generate_mnemonic(language="english", strength=128)
+        mnemonic = generate_random_mnemonic(128)
         process_mnemonic(message.chat.id, mnemonic, True)
     elif text in ["🎲 24 слова", "🎲 Случайный 24"]:
-        mnemonic = generate_mnemonic(language="english", strength=256)
+        mnemonic = generate_random_mnemonic(256)
         process_mnemonic(message.chat.id, mnemonic, True)
     elif text == "📜 История":
         show_history(message.chat.id)
@@ -66,7 +69,7 @@ def handle(message):
             return
         mnemonic = " ".join(words)
         if not mnemo.check(mnemonic):
-            bot.reply_to(message, "❌ Некоторые слова не из BIP39 (2048 слов)!")
+            bot.reply_to(message, "❌ Некоторые слова не из BIP39!")
             return
         process_mnemonic(message.chat.id, mnemonic, False)
 
@@ -100,7 +103,7 @@ def process_mnemonic(chat_id, mnemonic, is_random):
 🏠 Address:
 `{address}`
 
-🔑 WIF Private Key:
+🔑 WIF:
 `{wif}`
 
 💰 Баланс: {balance}
@@ -117,5 +120,5 @@ def show_history(chat_id):
         text += f"{item['date']} — {item['type']}\n`{item['address']}` — {item['balance']}\n\n"
     bot.send_message(chat_id, text, parse_mode="Markdown")
 
-print("🤖 Бот запущен на Railway...")
+print("🤖 Бот успешно запущен...")
 bot.infinity_polling()
