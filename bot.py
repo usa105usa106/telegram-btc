@@ -1104,12 +1104,35 @@ def parse_wifs_from_text(text: str) -> list[str]:
 
 
 def contains_private_wallet_data(text: str) -> bool:
+    """
+    Возвращает True только для реальных приватных данных.
+
+    Старые версии проверяли весь TXT одним куском, из-за чего public.txt
+    иногда ошибочно отклонялся как private.txt. Теперь проверка идёт
+    построчно: публичный BTC-адрес или HEX public-key в строке считается
+    безопасным, а WIF определяется только через Base58Check-валидацию.
+    """
     lower_text = text.lower()
+
+    # Явные приватные маркеры всё ещё блокируются.
     if any(marker in lower_text for marker in PRIVATE_WALLET_MARKERS):
         return True
-    # ВАЖНО: WIF считаем приватным только после Base58Check-валидации.
-    # Это убирает ложные срабатывания на обычных публичных адресах/публичных ключах.
-    return bool(parse_wifs_from_text(text))
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        # Если строка содержит публичный адрес или публичный HEX key, это
+        # не должно считаться private-файлом. Но если рядом в той же строке
+        # есть валидный WIF, файл всё равно блокируем.
+        line_wifs = parse_wifs_from_text(line)
+        if line_wifs:
+            return True
+        if parse_addresses_from_text(line):
+            continue
+
+    return False
 
 
 def public_scan_progress_text(checked: int, total: int, positive_count: int, chat_id: int) -> str:
