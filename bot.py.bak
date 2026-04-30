@@ -5,8 +5,6 @@ import html
 import io
 import json
 import os
-import sys
-import threading
 import re
 import secrets
 import time
@@ -29,13 +27,6 @@ from cryptography.fernet import Fernet, InvalidToken
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN или BOT_TOKEN не установлен в Railway Variables")
-
-BOT_VERSION = "101"
-ADMIN_TELEGRAM_IDS = {
-    item.strip()
-    for item in os.getenv("ADMIN_TELEGRAM_IDS", "").replace(";", ",").split(",")
-    if item.strip()
-}
 
 # Railway volume: если подключишь Volume, укажи mount path /data.
 # Бот сам возьмёт RAILWAY_VOLUME_MOUNT_PATH, а если его нет — будет писать рядом с bot.py.
@@ -504,7 +495,6 @@ def main_keyboard(chat_id: int | None = None) -> types.ReplyKeyboardMarkup:
     markup.add("🔐 Установить PIN", "🔄 Баланс последнего")
     markup.add("📋 Копировать всё", "📤 Проверить public.txt")
     markup.add("⚡ Настройки public.txt")
-    markup.add("🏓 Ping", "♻️ Рестарт")
     if chat_id is not None and is_private_key_mode_enabled(chat_id):
         markup.add("🔑 Приват ключ: ВКЛ")
     else:
@@ -605,61 +595,6 @@ def esc(value: Any) -> str:
 
 def code(value: Any) -> str:
     return f"<code>{html.escape(str(value), quote=False)}</code>"
-
-
-
-def is_restart_allowed(chat_id: int) -> bool:
-    """Если ADMIN_TELEGRAM_IDS не задан, рестарт доступен всем пользователям бота.
-    Если задан — только указанным Telegram ID через запятую.
-    """
-    return not ADMIN_TELEGRAM_IDS or str(chat_id) in ADMIN_TELEGRAM_IDS
-
-
-def send_ping(chat_id: int) -> None:
-    started = time.perf_counter()
-    try:
-        msg = bot.send_message(chat_id, "🏓 Проверяю ping...", reply_markup=main_keyboard(chat_id))
-        ping_ms = int((time.perf_counter() - started) * 1000)
-        bot.edit_message_text(
-            f"🏓 <b>Ping:</b> {ping_ms} ms\n🔢 <b>Версия:</b> {BOT_VERSION}",
-            chat_id=chat_id,
-            message_id=msg.message_id,
-        )
-    except Exception as exc:
-        bot.send_message(
-            chat_id,
-            f"🏓 Ping: ошибка проверки: {code(type(exc).__name__)}\n🔢 Версия: <b>{BOT_VERSION}</b>",
-            reply_markup=main_keyboard(chat_id),
-        )
-
-
-def restart_bot(chat_id: int) -> None:
-    if not is_restart_allowed(chat_id):
-        bot.send_message(
-            chat_id,
-            "⛔ Рестарт доступен только администратору бота. Добавь свой Telegram ID в Railway Variable ADMIN_TELEGRAM_IDS.",
-            reply_markup=main_keyboard(chat_id),
-        )
-        return
-
-    bot.send_message(
-        chat_id,
-        f"♻️ Перезапускаю бот...\n🔢 Версия: <b>{BOT_VERSION}</b>",
-        reply_markup=main_keyboard(chat_id),
-    )
-
-    def _restart() -> None:
-        time.sleep(1.2)
-        try:
-            bot.stop_polling()
-        except Exception:
-            pass
-        try:
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-        except Exception:
-            os._exit(1)
-
-    threading.Thread(target=_restart, daemon=True).start()
 
 
 def _balance_from_esplora_payload(data: dict[str, Any]) -> int:
@@ -1089,9 +1024,7 @@ def start(message):
         "✅ Кнопка 🔑 Приват ключ ВКЛ/ВЫКЛ включает режим генерации/экспорта только WIF.\n"
         f"✅ Кнопка 📋 Копировать всё отправляет два TXT-файла по последним {BATCH_WALLET_COUNT} записям: public.txt и private.txt.\n"
         "✅ Отдельно загруженный public.txt проверяется на баланс в ускоренном режиме без обработки private.txt/WIF/seed.\n"
-        "✅ Загруженный TXT со списком публичных адресов тоже проверяется на положительный баланс без обработки приватных ключей.\n"
-        f"✅ Кнопка 🏓 Ping показывает задержку ответа и версию {BOT_VERSION}.\n"
-        "✅ Кнопка ♻️ Рестарт перезапускает процесс бота.\n\n"
+        "✅ Загруженный TXT со списком публичных адресов тоже проверяется на положительный баланс без обработки приватных ключей.\n\n"
         "⚠️ Фразы из одинаковых слов небезопасны и подходят только для тестов/экспериментов.",
         reply_markup=main_keyboard(message.chat.id),
     )
@@ -1110,8 +1043,6 @@ def help_cmd(message):
         "• 📜 История — запросит PIN и покажет кошельки/ключи/баланс\n"
         "• 🔄 Баланс последнего — обновить баланс последней записи\n"
         "• 💰 Положительный баланс — временный RAM-список найденных адресов с балансом > 0\n"
-        f"• 🏓 Ping — показать ping и версию {BOT_VERSION}\n"
-        "• ♻️ Рестарт — перезапустить процесс бота\n"
         f"• ⚙️ Пакет: ВКЛ/ВЫКЛ — когда включено, 🎲 12/24 слова и 🎯 Рандом12/24 одинаковые создают сразу {BATCH_WALLET_COUNT} кошельков; проверка баланса доступна только для отдельно загруженного public.txt/CSV без private.txt/WIF\n"
         "• 🔑 Приват ключ ВКЛ/ВЫКЛ — в режиме ВКЛ новые генерации создают random private key → WIF без вывода seed-фраз\n"
         f"• 📋 Копировать всё — после PIN отправить public.txt и private.txt по последним {BATCH_WALLET_COUNT} ключам; номера строк совпадают\n"
@@ -1738,12 +1669,6 @@ def handle(message):
 
     if handle_public_scan_setting_value(message):
         return
-
-    if text in {"🏓 Ping", "ping", "/ping"}:
-        return send_ping(message.chat.id)
-
-    if text in {"♻️ Рестарт", "рестарт", "restart", "/restart"}:
-        return restart_bot(message.chat.id)
 
     if text in {"⚡ Настройки public.txt", "настройки public.txt", "public settings"}:
         return show_public_scan_settings(message.chat.id)
