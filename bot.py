@@ -1157,16 +1157,10 @@ PUBLIC_KEY_HEX_RE = re.compile(
     r"(?<![A-Fa-f0-9])((?:02|03)[0-9A-Fa-f]{64}|04[0-9A-Fa-f]{128})(?![A-Fa-f0-9])"
 )
 WIF_RE = re.compile(r"(?<![A-Za-z0-9])([5KL][1-9A-HJ-NP-Za-km-z]{50,51})(?![A-Za-z0-9])")
-PRIVATE_WALLET_MARKERS = (
-    "mnemonic:",
-    "wif:",
-    "seed:",
-    "private_key",
-    "private key",
-    "xprv",
-    "yprv",
-    "zprv",
-)
+# Приватные маркеры проверяются аккуратно, чтобы обычный public.txt
+# не блокировался из-за случайной подстроки вроде "xprv" внутри BTC-адреса.
+PRIVATE_LABEL_RE = re.compile(r"(?i)(?:^|[^a-z0-9_])(mnemonic|wif|seed|private[_ -]?key)\s*[:=]")
+EXTENDED_PRIVATE_KEY_RE = re.compile(r"(?<![A-Za-z0-9])(?:xprv|yprv|zprv)[1-9A-HJ-NP-Za-km-z]{40,}(?![A-Za-z0-9])")
 
 
 def base58_decode(text: str) -> bytes:
@@ -1266,30 +1260,33 @@ def contains_private_wallet_data(text: str) -> bool:
     """
     Возвращает True только для реальных приватных данных.
 
-    Старые версии проверяли весь TXT одним куском, из-за чего public.txt
-    иногда ошибочно отклонялся как private.txt. Теперь проверка идёт
-    построчно: публичный BTC-адрес или HEX public-key в строке считается
-    безопасным, а WIF определяется только через Base58Check-валидацию.
+    Важно: public.txt может содержать тысячи Base58-адресов, и внутри
+    обычного публичного адреса случайно встречаются подстроки вроде
+    "xprv"/"yprv"/"zprv". Поэтому нельзя искать приватные маркеры
+    простым `in` по всему файлу. Проверяем только валидный WIF через
+    Base58Check, явные подписи вида `wif:`/`seed:` и полноценные extended
+    private keys как отдельные токены. Публичные BTC-адреса и HEX public-key
+    никогда не считаются приватными данными.
     """
-    lower_text = text.lower()
-
-    # Явные приватные маркеры всё ещё блокируются.
-    if any(marker in lower_text for marker in PRIVATE_WALLET_MARKERS):
-        return True
-
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
 
-        # Если строка содержит публичный адрес или публичный HEX key, это
-        # не должно считаться private-файлом. Но если рядом в той же строке
-        # есть валидный WIF, файл всё равно блокируем.
-        line_wifs = parse_wifs_from_text(line)
-        if line_wifs:
+        # Явные подписи приватных данных блокируем, но только когда это
+        # именно метка с двоеточием/равно, а не случайная подстрока адреса.
+        if PRIVATE_LABEL_RE.search(line):
             return True
-        if parse_addresses_from_text(line):
-            continue
+
+        # Extended private key должен быть отдельным длинным токеном,
+        # а не частью публичного адреса.
+        if EXTENDED_PRIVATE_KEY_RE.search(line):
+            return True
+
+        # WIF определяется только строгой Base58Check-валидацией.
+        # Это убирает ложные срабатывания на публичные адреса/public-key.
+        if parse_wifs_from_text(line):
+            return True
 
     return False
 
