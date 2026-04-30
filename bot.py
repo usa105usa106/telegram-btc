@@ -51,6 +51,8 @@ bip39_words = set(mnemo.wordlist)
 session_positive_wallets: dict[str, list[dict[str, Any]]] = {}
 # PIN вводится один раз за сессию бота. После перезапуска потребуется снова.
 session_unlocked_chats: set[str] = set()
+# Счётчик проверенных публичных адресов хранится только в RAM и очищается после перезапуска бота.
+session_checked_counters: dict[str, int] = {}
 
 
 # ---------- storage ----------
@@ -348,6 +350,29 @@ def positive_balance_button_text(chat_id: int) -> str:
     return f"💰 Положительный баланс ({positive_wallet_count(chat_id)})"
 
 
+def checked_counter(chat_id: int) -> int:
+    return int(session_checked_counters.get(str(chat_id), 0) or 0)
+
+
+def increment_checked_counter(chat_id: int, amount: int = 1) -> int:
+    chat_key = str(chat_id)
+    session_checked_counters[chat_key] = checked_counter(chat_id) + max(0, int(amount))
+    return session_checked_counters[chat_key]
+
+
+def checked_counter_button_text(chat_id: int) -> str:
+    return f"📊 Проверено ({checked_counter(chat_id)})"
+
+
+def show_checked_counter(chat_id: int) -> None:
+    bot.send_message(
+        chat_id,
+        f"📊 <b>Проверено публичных адресов в текущей сессии:</b> {checked_counter(chat_id)}\n"
+        "Счётчик хранится только в памяти и сбрасывается после перезапуска бота.",
+        reply_markup=main_keyboard(chat_id),
+    )
+
+
 def show_session_positive_wallets(chat_id: int) -> None:
     items = session_positive_wallets.get(str(chat_id)) or []
     if not items:
@@ -389,9 +414,9 @@ def main_keyboard(chat_id: int | None = None) -> types.ReplyKeyboardMarkup:
     else:
         markup.add("🔑 Приват ключ: ВЫКЛ")
     if chat_id is not None:
-        markup.add(positive_balance_button_text(chat_id))
+        markup.add(positive_balance_button_text(chat_id), checked_counter_button_text(chat_id))
     else:
-        markup.add("💰 Положительный баланс (0)")
+        markup.add("💰 Положительный баланс (0)", "📊 Проверено (0)")
     if chat_id is not None and is_batch_enabled(chat_id):
         markup.add("⚙️ Пакет: ВКЛ")
     else:
@@ -599,7 +624,7 @@ def process_batch_private_keys(chat_id: int) -> None:
         "📋 Нажми «Копировать всё», чтобы получить два TXT-файла: public.txt и private.txt.\n"
         "• public.txt — публичные адреса, по одному в строке.\n"
         "• private.txt — WIF-ключи, по одному в строке.\n"
-        "💰 Балансы в пакетном режиме не проверяются автоматически. Для проверки загрузи public.txt как TXT со списком публичных адресов.",
+        "💰 При создании public.txt через «Копировать всё» бот сразу запустит автопроверку баланса по публичным адресам.",
         reply_markup=main_keyboard(chat_id),
     )
 
@@ -632,9 +657,9 @@ def process_batch_wallets(chat_id: int, source_type: str) -> None:
         f"✅ <b>Пакет создан:</b> {BATCH_WALLET_COUNT} кошельков.\n\n"
         f"Тип: <b>{esc(source_type)}</b>\n"
         f"🔐 Слова/WIF сохранены в историю и открываются только по PIN.\n"
-        f"💰 Баланс в пакетном режиме не проверяется автоматически; для нужного адреса используй ручную проверку.\n"
+        "💰 После создания public.txt через «Копировать всё» бот автоматически проверит баланс по публичным адресам.\n"
         f"📋 Нажми «Копировать всё», чтобы получить два TXT-файла по последним {BATCH_WALLET_COUNT} кошелькам: public.txt и private.txt.\n"
-        "📤 Для проверки баланса загрузи public.txt — файл только с публичными адресами, без приватных ключей.\n\n"
+        "📤 Проверка идёт только по публичным адресам из public.txt, без обработки private.txt/WIF/seed.\n\n"
         f"Первый адрес:\n{code(first_address)}\n\n"
         f"Последний адрес:\n{code(last_address)}",
         reply_markup=main_keyboard(chat_id),
@@ -683,7 +708,8 @@ def send_export_all(chat_id: int) -> None:
         bot.send_message(chat_id, error_text, reply_markup=main_keyboard(chat_id))
         return
 
-    export_count = len([line for line in public_text.splitlines() if line.strip()])
+    public_addresses = parse_addresses_from_text(public_text)
+    export_count = len(public_addresses)
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
 
     public_file = io.BytesIO(public_text.encode("utf-8"))
@@ -697,7 +723,7 @@ def send_export_all(chat_id: int) -> None:
         caption=(
             f"📄 public.txt готов: {export_count} публичных адресов.\n"
             "Формат: один публичный BTC-адрес в строке.\n"
-            "Этот файл можно загрузить обратно в бота для проверки баланса по публичным адресам."
+            "🔎 Автопроверка баланса по этому public.txt запускается сразу после отправки файлов."
         ),
     )
     bot.send_document(
@@ -709,8 +735,21 @@ def send_export_all(chat_id: int) -> None:
             "Номера строк соответствуют public.txt.\n"
             "⚠️ WIF даёт полный доступ к средствам. Храни private.txt офлайн и никому не отправляй."
         ),
-        reply_markup=main_keyboard(chat_id),
     )
+
+    if public_addresses:
+        scan_uploaded_address_file(
+            chat_id,
+            public_addresses,
+            source_name="созданного public.txt",
+            record_type="Auto public.txt scan",
+        )
+    else:
+        bot.send_message(
+            chat_id,
+            "⚠️ public.txt создан, но публичные адреса для автопроверки не распознаны.",
+            reply_markup=main_keyboard(chat_id),
+        )
 
 def request_export_all_pin(message) -> None:
     if not chat_has_pin(message.chat.id):
@@ -825,7 +864,8 @@ def start(message):
         "✅ PIN вводится один раз за сессию: история и экспорт больше не спрашивают его после разблокировки.\n"
         "✅ Кнопка 🔑 Приват ключ ВКЛ/ВЫКЛ включает режим генерации/экспорта только WIF.\n"
         f"✅ Кнопка 📋 Копировать всё отправляет два TXT-файла по последним {BATCH_WALLET_COUNT} записям: public.txt и private.txt.\n"
-        "✅ Загруженный TXT со списком публичных адресов проверяется на положительный баланс без обработки приватных ключей.\n\n"
+        "✅ Новый public.txt автоматически проверяется на баланс сразу после создания; проверка идёт без обработки private.txt/WIF/seed.\n"
+        "✅ Загруженный TXT со списком публичных адресов тоже проверяется на положительный баланс без обработки приватных ключей.\n\n"
         "⚠️ Фразы из одинаковых слов небезопасны и подходят только для тестов/экспериментов.",
         reply_markup=main_keyboard(message.chat.id),
     )
@@ -844,9 +884,9 @@ def help_cmd(message):
         "• 📜 История — запросит PIN и покажет кошельки/ключи/баланс\n"
         "• 🔄 Баланс последнего — обновить баланс последней записи\n"
         "• 💰 Положительный баланс — временный RAM-список найденных адресов с балансом > 0\n"
-        f"• ⚙️ Пакет: ВКЛ/ВЫКЛ — когда включено, 🎲 12/24 слова и 🎯 Рандом12/24 одинаковые создают сразу {BATCH_WALLET_COUNT} кошельков без автосканирования баланса\n"
+        f"• ⚙️ Пакет: ВКЛ/ВЫКЛ — когда включено, 🎲 12/24 слова и 🎯 Рандом12/24 одинаковые создают сразу {BATCH_WALLET_COUNT} кошельков; автопроверка запускается при создании public.txt через «Копировать всё»\n"
         "• 🔑 Приват ключ ВКЛ/ВЫКЛ — в режиме ВКЛ новые генерации создают random private key → WIF без вывода seed-фраз\n"
-        f"• 📋 Копировать всё — после PIN отправить public.txt и private.txt по последним {BATCH_WALLET_COUNT} ключам; номера строк совпадают\n"
+        f"• 📋 Копировать всё — после PIN отправить public.txt и private.txt по последним {BATCH_WALLET_COUNT} ключам; номера строк совпадают; public.txt сразу проверяется на баланс\n"
         "• 📤 Проверить public.txt — инструкция по загрузке файла public.txt; проверяются только публичные адреса, файлы с приватными ключами не принимаются\n"
         f"• /scan10000 seed words — проверить первые {BATCH_WALLET_COUNT} адресов из твоей seed-фразы (/scan1000 и /scan100 тоже работают)\n"
         "• /set_pin 12345 — задать PIN из 5 цифр\n\n"
@@ -870,6 +910,7 @@ def scan_owned_mnemonic_100(chat_id: int, mnemonic_phrase: str) -> None:
     for index in range(BATCH_WALLET_COUNT):
         address, wif, path = derive_bitcoin_wallet_at_index(mnemonic_phrase, index)
         balance = get_balance(address)
+        increment_checked_counter(chat_id)
         if str(balance).startswith("не удалось"):
             api_errors += 1
         if parse_balance_btc(balance) > 0:
@@ -953,6 +994,11 @@ BITCOIN_ADDRESS_RE = re.compile(
     r"(?<![A-Za-z0-9])((?:[13][a-km-zA-HJ-NP-Z1-9]{25,34})|(?:bc1[ac-hj-np-z02-9]{11,71}))(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
+# Сырые public key тоже безопасны для проверки: из них можно получить публичный P2PKH-адрес.
+# Поддерживаются compressed 02/03 + 32 байта и uncompressed 04 + 64 байта в HEX.
+PUBLIC_KEY_HEX_RE = re.compile(
+    r"(?<![A-Fa-f0-9])((?:02|03)[0-9A-Fa-f]{64}|04[0-9A-Fa-f]{128})(?![A-Fa-f0-9])"
+)
 WIF_RE = re.compile(r"(?<![A-Za-z0-9])([5KL][1-9A-HJ-NP-Za-km-z]{50,51})(?![A-Za-z0-9])")
 PRIVATE_WALLET_MARKERS = (
     "mnemonic:",
@@ -966,18 +1012,82 @@ PRIVATE_WALLET_MARKERS = (
 )
 
 
+def base58_decode(text: str) -> bytes:
+    num = 0
+    for char in text:
+        if char not in BASE58_ALPHABET:
+            raise ValueError("invalid base58 character")
+        num = num * 58 + BASE58_ALPHABET.index(char)
+    raw = num.to_bytes((num.bit_length() + 7) // 8, "big") if num else b""
+    leading_zeros = len(text) - len(text.lstrip("1"))
+    return b"\x00" * leading_zeros + raw
+
+
+def base58check_decode(text: str) -> bytes:
+    raw = base58_decode(text)
+    if len(raw) < 5:
+        raise ValueError("base58check payload too short")
+    payload, checksum = raw[:-4], raw[-4:]
+    expected = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    if not hmac.compare_digest(checksum, expected):
+        raise ValueError("base58check checksum mismatch")
+    return payload
+
+
+def is_valid_wif(value: str) -> bool:
+    try:
+        payload = base58check_decode(value.strip())
+    except Exception:
+        return False
+    if not payload or payload[0] != 0x80:
+        return False
+    # 1 byte version + 32 bytes key или + compressed marker 0x01.
+    if len(payload) == 33:
+        key = payload[1:]
+    elif len(payload) == 34 and payload[-1] == 0x01:
+        key = payload[1:-1]
+    else:
+        return False
+    private_int = int.from_bytes(key, "big")
+    return 1 <= private_int < SECP256K1_ORDER
+
+
+def public_key_hex_to_p2pkh_address(pubkey_hex: str) -> str | None:
+    try:
+        raw = bytes.fromhex(pubkey_hex.strip())
+    except ValueError:
+        return None
+    if len(raw) == 33 and raw[0] in (2, 3):
+        return base58check_encode(b"\x00" + hash160(raw))
+    if len(raw) == 65 and raw[0] == 4:
+        return base58check_encode(b"\x00" + hash160(raw))
+    return None
+
+
 def parse_addresses_from_text(text: str) -> list[str]:
     seen: set[str] = set()
     addresses: list[str] = []
-    for match in BITCOIN_ADDRESS_RE.finditer(text):
-        address = match.group(1).strip()
+
+    def add_address(address: str) -> None:
+        if len(addresses) >= BATCH_WALLET_COUNT:
+            return
         key = address.lower()
         if key in seen:
-            continue
+            return
         seen.add(key)
         addresses.append(address)
+
+    for match in BITCOIN_ADDRESS_RE.finditer(text):
+        add_address(match.group(1).strip())
+
+    # Если пользователь загрузил именно публичные ключи HEX, конвертируем их в legacy P2PKH-адреса.
+    for match in PUBLIC_KEY_HEX_RE.finditer(text):
         if len(addresses) >= BATCH_WALLET_COUNT:
             break
+        address = public_key_hex_to_p2pkh_address(match.group(1))
+        if address:
+            add_address(address)
+
     return addresses
 
 
@@ -986,7 +1096,7 @@ def parse_wifs_from_text(text: str) -> list[str]:
     wifs: list[str] = []
     for match in WIF_RE.finditer(text):
         wif = match.group(1).strip()
-        if wif in seen:
+        if wif in seen or not is_valid_wif(wif):
             continue
         seen.add(wif)
         wifs.append(wif)
@@ -997,13 +1107,22 @@ def parse_wifs_from_text(text: str) -> list[str]:
 
 def contains_private_wallet_data(text: str) -> bool:
     lower_text = text.lower()
-    return bool(parse_wifs_from_text(text)) or any(marker in lower_text for marker in PRIVATE_WALLET_MARKERS)
+    if any(marker in lower_text for marker in PRIVATE_WALLET_MARKERS):
+        return True
+    # ВАЖНО: WIF считаем приватным только после Base58Check-валидации.
+    # Это убирает ложные срабатывания на обычных публичных адресах/публичных ключах.
+    return bool(parse_wifs_from_text(text))
 
-
-def scan_uploaded_address_file(chat_id: int, addresses: list[str]) -> None:
+def scan_uploaded_address_file(
+    chat_id: int,
+    addresses: list[str],
+    *,
+    source_name: str = "TXT",
+    record_type: str = "Address file scan",
+) -> None:
     bot.send_message(
         chat_id,
-        f"🔎 Начинаю проверку адресов из TXT: {len(addresses)} шт.\n"
+        f"🔎 Начинаю проверку адресов из {esc(source_name)}: {len(addresses)} шт.\n"
         "Проверяются только публичные адреса; приватные ключи не сохраняются и не обрабатываются.",
         reply_markup=main_keyboard(chat_id),
     )
@@ -1012,21 +1131,26 @@ def scan_uploaded_address_file(chat_id: int, addresses: list[str]) -> None:
     api_errors = 0
     for index, address in enumerate(addresses, start=1):
         balance = get_balance(address)
+        increment_checked_counter(chat_id)
         if str(balance).startswith("не удалось"):
             api_errors += 1
         if parse_balance_btc(balance) > 0:
             record: dict[str, Any] = {
                 "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "type": "Address file scan",
+                "type": record_type,
                 "address": address,
                 "balance": balance,
-                "derivation_path": "address-only file",
+                "derivation_path": f"address-only {source_name}",
                 "index": index,
             }
             positive_records.append(record)
             remember_positive_wallet(chat_id, record)
         if index % 100 == 0 and index < len(addresses):
-            bot.send_message(chat_id, f"🔎 Проверено {index}/{len(addresses)} адресов…")
+            bot.send_message(
+                chat_id,
+                f"🔎 Проверено {index}/{len(addresses)} адресов…\n"
+                f"📊 Всего проверено в этой сессии: {checked_counter(chat_id)}",
+            )
         time.sleep(0.2)
 
     if positive_records:
@@ -1055,6 +1179,7 @@ def scan_uploaded_address_file(chat_id: int, addresses: list[str]) -> None:
         bot.send_message(
             chat_id,
             f"✅ Проверено адресов: {len(addresses)}.\n"
+            f"📊 Всего проверено в этой сессии: <b>{checked_counter(chat_id)}</b>.\n"
             f"💰 Найдено с балансом > 0: <b>{len(positive_records)}</b>.\n"
             "Список добавлен в RAM-кнопку «Положительный баланс» до перезапуска бота.\n"
             "Положительные адреса сохранены в историю без приватных ключей.\n\n"
@@ -1067,6 +1192,7 @@ def scan_uploaded_address_file(chat_id: int, addresses: list[str]) -> None:
         bot.send_message(
             chat_id,
             f"✅ Проверено адресов: {len(addresses)}.\n"
+            f"📊 Всего проверено в этой сессии: <b>{checked_counter(chat_id)}</b>.\n"
             "💰 Адресов с балансом > 0 не найдено."
             f"{err_line}",
             reply_markup=main_keyboard(chat_id),
@@ -1103,7 +1229,7 @@ def handle_document_upload(message):
 
     addresses = parse_addresses_from_text(text)
     if not addresses:
-        bot.send_message(message.chat.id, "❌ В файле не нашёл BTC-адресов. Формат: один публичный адрес в строке.", reply_markup=main_keyboard(message.chat.id))
+        bot.send_message(message.chat.id, "❌ В файле не нашёл публичных BTC-адресов или HEX public-key. Формат: один публичный адрес или один public-key в строке.", reply_markup=main_keyboard(message.chat.id))
         return
 
     scan_uploaded_address_file(message.chat.id, addresses)
@@ -1190,7 +1316,7 @@ def handle(message):
             message.chat.id,
             "📤 Загрузи сюда файл public.txt или CSV/TXT со списком публичных BTC-адресов, по одному адресу в строке.\n\n"
             f"Бот проверит до {BATCH_WALLET_COUNT} публичных адресов, покажет адреса с балансом > 0 и сохранит их в историю без приватных ключей. "
-            "Файлы private.txt/WIF/seed для проверки не принимаются.",
+            "Файлы private.txt/WIF/seed для проверки не принимаются. Если в TXT лежат HEX public-key, бот сконвертирует их в legacy P2PKH-адреса и проверит баланс.",
             reply_markup=main_keyboard(message.chat.id),
         )
 
@@ -1199,6 +1325,9 @@ def handle(message):
 
     if text.startswith("💰 Положительный баланс"):
         return show_session_positive_wallets(message.chat.id)
+
+    if text.startswith("📊 Проверено"):
+        return show_checked_counter(message.chat.id)
 
     if text == "📝 Ввести mnemonic":
         return bot.send_message(
