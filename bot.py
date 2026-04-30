@@ -36,8 +36,8 @@ SECRET_KEY_FILE = Path(os.getenv("SECRET_KEY_FILE") or (DATA_DIR / "history_secr
 SETTINGS_FILE = Path(os.getenv("SETTINGS_FILE") or (DATA_DIR / "wallets_settings.json"))
 
 DERIVATION_PATH = "m/44'/0'/0'/0/0"
-MAX_HISTORY_PER_CHAT = 5000
-BATCH_WALLET_COUNT = 1000
+MAX_HISTORY_PER_CHAT = 30000
+BATCH_WALLET_COUNT = 10000
 TELEGRAM_COPY_CHUNK_SIZE = 3600
 MAX_UPLOAD_FILE_BYTES = 1_000_000
 PIN_LEN = 5
@@ -383,7 +383,7 @@ def main_keyboard(chat_id: int | None = None) -> types.ReplyKeyboardMarkup:
     markup.add("🎯 Рандом12 одинаковые", "🎯 Рандом24 одинаковые")
     markup.add("📝 Ввести mnemonic", "📜 История")
     markup.add("🔐 Установить PIN", "🔄 Баланс последнего")
-    markup.add("📋 Копировать всё")
+    markup.add("📋 Копировать всё", "📤 Проверить public.txt")
     if chat_id is not None and is_private_key_mode_enabled(chat_id):
         markup.add("🔑 Приват ключ: ВКЛ")
     else:
@@ -596,8 +596,10 @@ def process_batch_private_keys(chat_id: int) -> None:
         f"✅ <b>Пакет создан:</b> {BATCH_WALLET_COUNT} приватных ключей.\n\n"
         "Формат генерации: random private key → WIF.\n"
         "🔐 WIF сохранены в зашифрованную историю.\n"
-        "📋 Нажми «Копировать всё», чтобы получить TXT-файл: один WIF в строке.\n"
-        "💰 Балансы в пакетном режиме не проверяются автоматически. Для проверки используй публичные адреса или кнопку «Баланс последнего» для конкретной записи.",
+        "📋 Нажми «Копировать всё», чтобы получить два TXT-файла: public.txt и private.txt.\n"
+        "• public.txt — публичные адреса, по одному в строке.\n"
+        "• private.txt — WIF-ключи, по одному в строке.\n"
+        "💰 Балансы в пакетном режиме не проверяются автоматически. Для проверки загрузи public.txt как TXT со списком публичных адресов.",
         reply_markup=main_keyboard(chat_id),
     )
 
@@ -631,63 +633,81 @@ def process_batch_wallets(chat_id: int, source_type: str) -> None:
         f"Тип: <b>{esc(source_type)}</b>\n"
         f"🔐 Слова/WIF сохранены в историю и открываются только по PIN.\n"
         f"💰 Баланс в пакетном режиме не проверяется автоматически; для нужного адреса используй ручную проверку.\n"
-        f"📋 Нажми «Копировать всё», чтобы получить TXT-файл: один WIF в строке по последним {BATCH_WALLET_COUNT} кошелькам.\n"
-        "📤 Для массовой проверки баланса загружай только TXT со списком публичных адресов без приватных ключей.\n\n"
+        f"📋 Нажми «Копировать всё», чтобы получить два TXT-файла по последним {BATCH_WALLET_COUNT} кошелькам: public.txt и private.txt.\n"
+        "📤 Для проверки баланса загрузи public.txt — файл только с публичными адресами, без приватных ключей.\n\n"
         f"Первый адрес:\n{code(first_address)}\n\n"
         f"Последний адрес:\n{code(last_address)}",
         reply_markup=main_keyboard(chat_id),
     )
 
 
-def build_wallet_export_text(chat_id: int, pin: str | None = None, limit: int = BATCH_WALLET_COUNT) -> tuple[str | None, str]:
-    """Готовит TXT-экспорт: один приватный ключ WIF в строке."""
+def build_wallet_export_files(chat_id: int, pin: str | None = None, limit: int = BATCH_WALLET_COUNT) -> tuple[str | None, str | None, str]:
+    """Готовит два TXT-файла: public.txt и private.txt. Номера строк совпадают."""
     if not chat_has_pin(chat_id):
-        return None, "🔐 Сначала установи PIN. Без PIN WIF не сохраняется и экспортировать приватные ключи нельзя."
+        return None, None, "🔐 Сначала установи PIN. Без PIN приватные ключи WIF не сохраняются и private.txt создать нельзя."
     if not is_chat_unlocked(chat_id):
         if pin is None or not verify_chat_pin(chat_id, pin):
-            return None, "❌ Неверный PIN."
+            return None, None, "❌ Неверный PIN."
         unlock_chat(chat_id)
 
     items = (history.get(str(chat_id)) or [])[-limit:]
     if not items:
-        return None, "История пуста — сначала создай пакет кошельков."
+        return None, None, "История пуста — сначала создай пакет кошельков."
 
-    lines: list[str] = []
+    public_lines: list[str] = []
+    private_lines: list[str] = []
     for item in items:
+        address = str(item.get("address") or "").strip()
         token = item.get("secret")
-        if not token:
+        if not address or not token:
             continue
         try:
             secret_data = decrypt_json(str(token))
             wif = str(secret_data.get("wif") or "").strip()
-            if wif:
-                lines.append(wif)
         except (InvalidToken, Exception):
             continue
+        if not wif:
+            continue
+        # Важно: добавляем обе строки одновременно, чтобы номера строк в public/private совпадали.
+        public_lines.append(address)
+        private_lines.append(wif)
 
-    if not lines:
-        return None, "В последних записях нет сохранённых WIF. Установи PIN до генерации новых ключей."
-    return "\n".join(lines) + "\n", ""
+    if not public_lines or not private_lines:
+        return None, None, "В последних записях нет пары address + WIF. Установи PIN до генерации новых ключей и создай пакет заново."
+    return "\n".join(public_lines) + "\n", "\n".join(private_lines) + "\n", ""
 
 
 def send_export_all(chat_id: int) -> None:
-    export_text, error_text = build_wallet_export_text(chat_id, None)
+    public_text, private_text, error_text = build_wallet_export_files(chat_id, None)
     if error_text:
         bot.send_message(chat_id, error_text, reply_markup=main_keyboard(chat_id))
         return
 
-    export_count = len([line for line in export_text.splitlines() if line.strip()])
-    filename = f"private_keys_wif_{export_count}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    file_obj = io.BytesIO(export_text.encode("utf-8"))
-    file_obj.name = filename
+    export_count = len([line for line in public_text.splitlines() if line.strip()])
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    public_file = io.BytesIO(public_text.encode("utf-8"))
+    public_file.name = f"public_{export_count}_{ts}.txt"
+    private_file = io.BytesIO(private_text.encode("utf-8"))
+    private_file.name = f"private_{export_count}_{ts}.txt"
+
     bot.send_document(
         chat_id,
-        file_obj,
+        public_file,
         caption=(
-            f"📋 TXT-экспорт готов: {export_count} приватных ключей WIF.\n"
-            "Формат: один приватный ключ в строке.\n"
-            "⚠️ WIF даёт полный доступ к средствам. Храни файл офлайн и никому не отправляй.\n\n"
-            "Для массовой проверки баланса загружай TXT только с публичными адресами, без приватных ключей."
+            f"📄 public.txt готов: {export_count} публичных адресов.\n"
+            "Формат: один публичный BTC-адрес в строке.\n"
+            "Этот файл можно загрузить обратно в бота для проверки баланса по публичным адресам."
+        ),
+    )
+    bot.send_document(
+        chat_id,
+        private_file,
+        caption=(
+            f"🔐 private.txt готов: {export_count} приватных ключей WIF.\n"
+            "Формат: один WIF в строке.\n"
+            "Номера строк соответствуют public.txt.\n"
+            "⚠️ WIF даёт полный доступ к средствам. Храни private.txt офлайн и никому не отправляй."
         ),
         reply_markup=main_keyboard(chat_id),
     )
@@ -699,7 +719,7 @@ def request_export_all_pin(message) -> None:
         return send_export_all(message.chat.id)
     sent = bot.send_message(
         message.chat.id,
-        f"🔐 Введи PIN-код из {PIN_LEN} цифр один раз за эту сессию, чтобы получить TXT-файл с приватными ключами WIF:",
+        f"🔐 Введи PIN-код из {PIN_LEN} цифр один раз за эту сессию, чтобы получить public.txt и private.txt:",
         reply_markup=main_keyboard(message.chat.id),
     )
     bot.register_next_step_handler(sent, export_all_after_pin)
@@ -767,7 +787,7 @@ def ask_set_pin(message) -> None:
     bot.send_message(
         message.chat.id,
         "🔐 Для истории с ключами задай PIN из 5 цифр:\n<code>/set_pin 12345</code>\n\n"
-        "После установки PIN бот будет сохранять ключи в историю, а экспорт выдаст TXT: один WIF в строке.",
+        "После установки PIN бот будет сохранять ключи в историю, а экспорт выдаст два TXT-файла: public.txt и private.txt.",
         reply_markup=main_keyboard(message.chat.id),
     )
 
@@ -801,10 +821,10 @@ def start(message):
         "✅ Рандом12/Рандом24 из одного случайного BIP39-слова.\n"
         "✅ История с ключами открывается только по PIN из 5 цифр.\n"
         f"✅ Пакетный режим создаёт сразу {BATCH_WALLET_COUNT} новых кошельков.\n"
-        f"✅ /scan1000 проверяет первые {BATCH_WALLET_COUNT} адресов из твоей seed-фразы для восстановления (/scan100 тоже работает).\n"
+        f"✅ /scan10000 проверяет первые {BATCH_WALLET_COUNT} адресов из твоей seed-фразы для восстановления (/scan1000 и /scan100 тоже работают).\n"
         "✅ PIN вводится один раз за сессию: история и экспорт больше не спрашивают его после разблокировки.\n"
         "✅ Кнопка 🔑 Приват ключ ВКЛ/ВЫКЛ включает режим генерации/экспорта только WIF.\n"
-        f"✅ Кнопка 📋 Копировать всё отправляет TXT-файл: один WIF в строке по последним {BATCH_WALLET_COUNT} ключам после PIN.\n"
+        f"✅ Кнопка 📋 Копировать всё отправляет два TXT-файла по последним {BATCH_WALLET_COUNT} записям: public.txt и private.txt.\n"
         "✅ Загруженный TXT со списком публичных адресов проверяется на положительный баланс без обработки приватных ключей.\n\n"
         "⚠️ Фразы из одинаковых слов небезопасны и подходят только для тестов/экспериментов.",
         reply_markup=main_keyboard(message.chat.id),
@@ -824,11 +844,11 @@ def help_cmd(message):
         "• 📜 История — запросит PIN и покажет кошельки/ключи/баланс\n"
         "• 🔄 Баланс последнего — обновить баланс последней записи\n"
         "• 💰 Положительный баланс — временный RAM-список найденных адресов с балансом > 0\n"
-        f"• ⚙️ Пакет: ВКЛ/ВЫКЛ — когда включено, 🎲 12 слов и 🎲 24 слова создают сразу {BATCH_WALLET_COUNT} кошельков без автосканирования баланса\n"
+        f"• ⚙️ Пакет: ВКЛ/ВЫКЛ — когда включено, 🎲 12/24 слова и 🎯 Рандом12/24 одинаковые создают сразу {BATCH_WALLET_COUNT} кошельков без автосканирования баланса\n"
         "• 🔑 Приват ключ ВКЛ/ВЫКЛ — в режиме ВКЛ новые генерации создают random private key → WIF без вывода seed-фраз\n"
-        f"• 📋 Копировать всё — после PIN отправить TXT-файл: один WIF в строке по последним {BATCH_WALLET_COUNT} ключам\n"
-        "• 📤 Загрузка TXT со списком адресов — проверить до 1000 публичных адресов на положительный баланс; файлы с приватными ключами не принимаются\n"
-        f"• /scan1000 seed words — проверить первые {BATCH_WALLET_COUNT} адресов из твоей seed-фразы (/scan100 тоже работает)\n"
+        f"• 📋 Копировать всё — после PIN отправить public.txt и private.txt по последним {BATCH_WALLET_COUNT} ключам; номера строк совпадают\n"
+        "• 📤 Проверить public.txt — инструкция по загрузке файла public.txt; проверяются только публичные адреса, файлы с приватными ключами не принимаются\n"
+        f"• /scan10000 seed words — проверить первые {BATCH_WALLET_COUNT} адресов из твоей seed-фразы (/scan1000 и /scan100 тоже работают)\n"
         "• /set_pin 12345 — задать PIN из 5 цифр\n\n"
         f"Путь деривации: {code(DERIVATION_PATH)}\n"
         f"Файл истории: {code(HISTORY_FILE)}",
@@ -898,15 +918,15 @@ def scan_owned_mnemonic_100(chat_id: int, mnemonic_phrase: str) -> None:
         )
 
 
-@bot.message_handler(commands=["scan100", "scan1000"])
+@bot.message_handler(commands=["scan100", "scan1000", "scan10000"])
 def scan100_cmd(message):
     parts = (message.text or "").strip().split(maxsplit=1)
     if len(parts) != 2:
         bot.send_message(
             message.chat.id,
             "🔎 Проверка своих адресов:\n"
-            "<code>/scan1000 word1 word2 ... word12</code>\n"
-            "или старый алиас: <code>/scan100 word1 word2 ... word12</code>\n\n"
+            "<code>/scan10000 word1 word2 ... word12</code>\n"
+            "или старые алиасы: <code>/scan1000 ...</code> и <code>/scan100 ...</code>\n\n"
             f"Команда проверяет первые {BATCH_WALLET_COUNT} адресов из введённой seed-фразы по пути m/44'/0'/0'/0/i. "
             "Случайные кошельки не генерируются.",
             reply_markup=main_keyboard(message.chat.id),
@@ -920,7 +940,7 @@ def scan100_cmd(message):
     if not checksum_ok:
         bot.send_message(
             message.chat.id,
-            "⚠️ BIP39 checksum у фразы неверный. Для scan100 нужна корректная seed-фраза от твоего кошелька.",
+            "⚠️ BIP39 checksum у фразы неверный. Для сканирования нужна корректная seed-фраза от твоего кошелька.",
             reply_markup=main_keyboard(message.chat.id),
         )
         return
@@ -1010,6 +1030,8 @@ def scan_uploaded_address_file(chat_id: int, addresses: list[str]) -> None:
         time.sleep(0.2)
 
     if positive_records:
+        # Сохраняем только публичные адреса и баланс; приватные ключи/WIF из файла не принимаются и не сохраняются.
+        add_history_records(chat_id, positive_records)
         lines = [
             "BTC Wallet Bot — адреса с положительным балансом",
             f"Дата проверки: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
@@ -1034,7 +1056,8 @@ def scan_uploaded_address_file(chat_id: int, addresses: list[str]) -> None:
             chat_id,
             f"✅ Проверено адресов: {len(addresses)}.\n"
             f"💰 Найдено с балансом > 0: <b>{len(positive_records)}</b>.\n"
-            "Список добавлен в RAM-кнопку «Положительный баланс» до перезапуска бота.\n\n"
+            "Список добавлен в RAM-кнопку «Положительный баланс» до перезапуска бота.\n"
+            "Положительные адреса сохранены в историю без приватных ключей.\n\n"
             + "\n\n".join(shown) + extra,
             reply_markup=main_keyboard(chat_id),
         )
@@ -1073,7 +1096,7 @@ def handle_document_upload(message):
         bot.send_message(
             message.chat.id,
             "⚠️ Этот файл содержит приватные данные: WIF/private-key или seed.\n\n"
-            "Я не проверяю баланс по спискам приватных ключей. Для массовой проверки загрузи отдельный TXT/CSV только с публичными BTC-адресами, без WIF/seed.",
+            "Я не проверяю баланс по спискам приватных ключей. Для проверки загрузи public.txt или отдельный TXT/CSV только с публичными BTC-адресами, без WIF/seed.",
             reply_markup=main_keyboard(message.chat.id),
         )
         return
@@ -1098,7 +1121,7 @@ def handle(message):
         return bot.send_message(
             message.chat.id,
             f"⚙️ Пакетный режим: <b>{status}</b>.\n"
-            f"Когда режим включён, кнопки генерации создают сразу {BATCH_WALLET_COUNT} записей и сохраняют их в PIN-историю.",
+            f"Когда режим включён, кнопки 🎲 12/24 слова и 🎯 Рандом12/24 одинаковые создают сразу {BATCH_WALLET_COUNT} записей и сохраняют их в PIN-историю.",
             reply_markup=main_keyboard(message.chat.id),
         )
 
@@ -1109,7 +1132,7 @@ def handle(message):
             message.chat.id,
             f"🔑 Режим приватного ключа: <b>{status}</b>.\n"
             "Когда режим включён, кнопки генерации создают random private key → WIF, без вывода seed-фраз. "
-            "Экспорт «Копировать всё» выдаёт TXT: один WIF в строке.",
+            "Экспорт «Копировать всё» выдаёт два файла: public.txt и private.txt.",
             reply_markup=main_keyboard(message.chat.id),
         )
 
@@ -1138,6 +1161,8 @@ def handle(message):
             if is_batch_enabled(message.chat.id):
                 return process_batch_private_keys(message.chat.id)
             return process_random_private_key(message.chat.id)
+        if is_batch_enabled(message.chat.id):
+            return process_batch_wallets(message.chat.id, "SameWord 12")
         mnemonic_phrase = same_word_mnemonic(12)
         return process_mnemonic(message.chat.id, mnemonic_phrase, True, source_type="SameWord 12")
 
@@ -1146,6 +1171,8 @@ def handle(message):
             if is_batch_enabled(message.chat.id):
                 return process_batch_private_keys(message.chat.id)
             return process_random_private_key(message.chat.id)
+        if is_batch_enabled(message.chat.id):
+            return process_batch_wallets(message.chat.id, "SameWord 24")
         mnemonic_phrase = same_word_mnemonic(24)
         return process_mnemonic(message.chat.id, mnemonic_phrase, True, source_type="SameWord 24")
 
@@ -1157,6 +1184,15 @@ def handle(message):
 
     if text == "🔄 Баланс последнего":
         return refresh_last_balance(message.chat.id)
+
+    if text in {"📤 Проверить public.txt", "проверить public.txt", "check public.txt"}:
+        return bot.send_message(
+            message.chat.id,
+            "📤 Загрузи сюда файл public.txt или CSV/TXT со списком публичных BTC-адресов, по одному адресу в строке.\n\n"
+            f"Бот проверит до {BATCH_WALLET_COUNT} публичных адресов, покажет адреса с балансом > 0 и сохранит их в историю без приватных ключей. "
+            "Файлы private.txt/WIF/seed для проверки не принимаются.",
+            reply_markup=main_keyboard(message.chat.id),
+        )
 
     if text in {"📋 Копировать всё", "копировать всё", "copy all", "export100", "export1000"}:
         return request_export_all_pin(message)
