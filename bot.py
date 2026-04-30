@@ -5,6 +5,7 @@ import html
 import io
 import json
 import os
+import re
 import secrets
 import time
 import unicodedata
@@ -38,6 +39,7 @@ DERIVATION_PATH = "m/44'/0'/0'/0/0"
 MAX_HISTORY_PER_CHAT = 5000
 BATCH_WALLET_COUNT = 1000
 TELEGRAM_COPY_CHUNK_SIZE = 3600
+MAX_UPLOAD_FILE_BYTES = 1_000_000
 PIN_LEN = 5
 PIN_HASH_ITERATIONS = 240_000
 
@@ -47,6 +49,8 @@ bip39_words = set(mnemo.wordlist)
 
 # Хранится только в RAM и очищается после перезапуска бота.
 session_positive_wallets: dict[str, list[dict[str, Any]]] = {}
+# PIN вводится один раз за сессию бота. После перезапуска потребуется снова.
+session_unlocked_chats: set[str] = set()
 
 
 # ---------- storage ----------
@@ -109,6 +113,7 @@ def get_chat_settings(chat_id: int) -> dict[str, Any]:
         rec = {}
         settings[chat_key] = rec
     rec.setdefault("batch_enabled", False)
+    rec.setdefault("private_key_only_enabled", False)
     return rec
 
 
@@ -121,6 +126,25 @@ def toggle_batch_enabled(chat_id: int) -> bool:
     rec["batch_enabled"] = not bool(rec.get("batch_enabled"))
     save_settings()
     return bool(rec["batch_enabled"])
+
+
+def is_private_key_mode_enabled(chat_id: int) -> bool:
+    return bool(get_chat_settings(chat_id).get("private_key_only_enabled"))
+
+
+def toggle_private_key_mode_enabled(chat_id: int) -> bool:
+    rec = get_chat_settings(chat_id)
+    rec["private_key_only_enabled"] = not bool(rec.get("private_key_only_enabled"))
+    save_settings()
+    return bool(rec["private_key_only_enabled"])
+
+
+def is_chat_unlocked(chat_id: int) -> bool:
+    return str(chat_id) in session_unlocked_chats
+
+
+def unlock_chat(chat_id: int) -> None:
+    session_unlocked_chats.add(str(chat_id))
 
 
 def get_master_fernet() -> Fernet:
@@ -207,6 +231,41 @@ def private_key_to_wif(private_key: bytes, compressed: bool = True) -> str:
         raise ValueError("private key должен быть 32 bytes")
     payload = b"\x80" + private_key + (b"\x01" if compressed else b"")
     return base58check_encode(payload)
+
+
+SECP256K1_ORDER = int("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
+
+
+def hash160(data: bytes) -> bytes:
+    sha = hashlib.sha256(data).digest()
+    ripe = hashlib.new("ripemd160")
+    ripe.update(sha)
+    return ripe.digest()
+
+
+def private_key_bytes_to_p2pkh_address(private_key: bytes) -> str:
+    # Стандартный legacy P2PKH-адрес для compressed public key.
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    private_int = int.from_bytes(private_key, "big")
+    if not (1 <= private_int < SECP256K1_ORDER):
+        raise ValueError("private key вне диапазона secp256k1")
+    key = ec.derive_private_key(private_int, ec.SECP256K1())
+    numbers = key.public_key().public_numbers()
+    prefix = b"\x02" if numbers.y % 2 == 0 else b"\x03"
+    compressed_pubkey = prefix + numbers.x.to_bytes(32, "big")
+    return base58check_encode(b"\x00" + hash160(compressed_pubkey))
+
+
+def generate_random_private_key_wallet() -> Tuple[str, str]:
+    while True:
+        private_key = secrets.token_bytes(32)
+        private_int = int.from_bytes(private_key, "big")
+        if 1 <= private_int < SECP256K1_ORDER:
+            break
+    address = private_key_bytes_to_p2pkh_address(private_key)
+    wif = private_key_to_wif(private_key, compressed=True)
+    return address, wif
 
 
 def mnemonic_to_seed(mnemonic_phrase: str, passphrase: str = "") -> bytes:
@@ -325,6 +384,10 @@ def main_keyboard(chat_id: int | None = None) -> types.ReplyKeyboardMarkup:
     markup.add("📝 Ввести mnemonic", "📜 История")
     markup.add("🔐 Установить PIN", "🔄 Баланс последнего")
     markup.add("📋 Копировать всё")
+    if chat_id is not None and is_private_key_mode_enabled(chat_id):
+        markup.add("🔑 Приват ключ: ВКЛ")
+    else:
+        markup.add("🔑 Приват ключ: ВЫКЛ")
     if chat_id is not None:
         markup.add(positive_balance_button_text(chat_id))
     else:
@@ -469,6 +532,76 @@ def generate_mnemonic_for_source(source_type: str) -> str:
     raise ValueError(f"Неизвестный тип генерации: {source_type}")
 
 
+def build_private_key_record(chat_id: int, source_type: str, balance: str = "не проверялся") -> tuple[dict[str, Any], str, str]:
+    address, wif = generate_random_private_key_wallet()
+    record: dict[str, Any] = {
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "type": source_type,
+        "address": address,
+        "balance": balance,
+        "checksum_ok": True,
+    }
+    if chat_has_pin(chat_id):
+        record["secret"] = encrypt_json({
+            "wif": wif,
+            "derivation_path": "random-private-key",
+        })
+    return record, address, wif
+
+
+def process_random_private_key(chat_id: int) -> None:
+    record, address, wif = build_private_key_record(chat_id, "Random private key", balance="не проверялся")
+    add_history_records(chat_id, [record])
+    save_line = (
+        "🔐 WIF сохранён в зашифрованную историю."
+        if chat_has_pin(chat_id)
+        else "⚠️ PIN не установлен — в историю сохранены только адрес и баланс. Нажми 🔐 Установить PIN."
+    )
+    if is_private_key_mode_enabled(chat_id):
+        text = (
+            "✅ <b>Приватный ключ создан</b>\n\n"
+            f"🔑 WIF:\n{code(wif)}\n\n"
+            f"💰 Баланс: <b>{esc(record['balance'])}</b>\n\n"
+            f"{esc(save_line)}\n"
+            "⚠️ Приватный ключ даёт полный доступ к кошельку. Никому его не отправляй."
+        )
+    else:
+        text = (
+            "✅ <b>Приватный ключ создан</b>\n\n"
+            f"🏠 Публичный адрес:\n{code(address)}\n\n"
+            f"🔑 WIF:\n{code(wif)}\n\n"
+            f"💰 Баланс: <b>{esc(record['balance'])}</b>\n\n"
+            f"{esc(save_line)}"
+        )
+    bot.send_message(chat_id, text, reply_markup=main_keyboard(chat_id))
+
+
+def process_batch_private_keys(chat_id: int) -> None:
+    if not chat_has_pin(chat_id):
+        bot.send_message(
+            chat_id,
+            "🔐 Для пакетного режима сначала установи PIN. Это нужно, чтобы WIF сохранялись в зашифрованную историю.",
+            reply_markup=main_keyboard(chat_id),
+        )
+        return
+
+    records: list[dict[str, Any]] = []
+    for _ in range(BATCH_WALLET_COUNT):
+        record, _address, _wif = build_private_key_record(chat_id, "Batch random private key", balance="не проверялся")
+        records.append(record)
+
+    add_history_records(chat_id, records)
+    bot.send_message(
+        chat_id,
+        f"✅ <b>Пакет создан:</b> {BATCH_WALLET_COUNT} приватных ключей.\n\n"
+        "Формат генерации: random private key → WIF.\n"
+        "🔐 WIF сохранены в зашифрованную историю.\n"
+        "📋 Нажми «Копировать всё», чтобы получить TXT-файл: один WIF в строке.\n"
+        "💰 Балансы в пакетном режиме не проверяются автоматически. Для проверки используй публичные адреса или кнопку «Баланс последнего» для конкретной записи.",
+        reply_markup=main_keyboard(chat_id),
+    )
+
+
 def process_batch_wallets(chat_id: int, source_type: str) -> None:
     if not chat_has_pin(chat_id):
         bot.send_message(
@@ -498,75 +631,75 @@ def process_batch_wallets(chat_id: int, source_type: str) -> None:
         f"Тип: <b>{esc(source_type)}</b>\n"
         f"🔐 Слова/WIF сохранены в историю и открываются только по PIN.\n"
         f"💰 Баланс в пакетном режиме не проверяется автоматически; для нужного адреса используй ручную проверку.\n"
-        f"📋 Нажми «Копировать всё», чтобы получить все {BATCH_WALLET_COUNT} seed-фраз/WIF прямо сообщениями в Telegram.\n\n"
+        f"📋 Нажми «Копировать всё», чтобы получить TXT-файл: один WIF в строке по последним {BATCH_WALLET_COUNT} кошелькам.\n"
+        "📤 Для массовой проверки баланса загружай только TXT со списком публичных адресов без приватных ключей.\n\n"
         f"Первый адрес:\n{code(first_address)}\n\n"
         f"Последний адрес:\n{code(last_address)}",
         reply_markup=main_keyboard(chat_id),
     )
 
 
-def build_wallet_export_text(chat_id: int, pin: str, limit: int = BATCH_WALLET_COUNT) -> tuple[str | None, str]:
-    """Готовит текстовый экспорт последних кошельков. Секреты раскрываются только после PIN."""
+def build_wallet_export_text(chat_id: int, pin: str | None = None, limit: int = BATCH_WALLET_COUNT) -> tuple[str | None, str]:
+    """Готовит TXT-экспорт: один приватный ключ WIF в строке."""
     if not chat_has_pin(chat_id):
-        return None, "🔐 Сначала установи PIN. Без PIN seed/WIF не сохраняются и экспортировать их нельзя."
-    if not verify_chat_pin(chat_id, pin):
-        return None, "❌ Неверный PIN."
+        return None, "🔐 Сначала установи PIN. Без PIN WIF не сохраняется и экспортировать приватные ключи нельзя."
+    if not is_chat_unlocked(chat_id):
+        if pin is None or not verify_chat_pin(chat_id, pin):
+            return None, "❌ Неверный PIN."
+        unlock_chat(chat_id)
 
     items = (history.get(str(chat_id)) or [])[-limit:]
     if not items:
         return None, "История пуста — сначала создай пакет кошельков."
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    lines = [
-        "BTC Wallet Bot — экспорт последних кошельков",
-        f"Дата экспорта: {now}",
-        f"Количество записей: {len(items)}",
-        "",
-        "ВНИМАНИЕ: seed-фраза и WIF дают полный доступ к кошельку. Храни файл офлайн и никому не отправляй.",
-        "",
-    ]
-
-    exported_secrets = 0
-    for idx, item in enumerate(items, start=1):
-        lines.append(f"#{idx}")
-        lines.append(f"date: {item.get('date', '?')}")
-        lines.append(f"type: {item.get('type', '?')}")
-        lines.append(f"address: {item.get('address', '?')}")
-        lines.append(f"balance: {item.get('balance', '?')}")
-        lines.append(f"checksum_ok: {item.get('checksum_ok', '?')}")
-
+    lines: list[str] = []
+    for item in items:
         token = item.get("secret")
-        if token:
-            try:
-                secret_data = decrypt_json(str(token))
-                mnemonic_value = secret_data.get("mnemonic", "?")
-                wif_value = secret_data.get("wif", "?")
-                derivation_path = secret_data.get("derivation_path", item.get("derivation_path", DERIVATION_PATH))
-                index_value = secret_data.get("index", item.get("index"))
-                lines.append(f"mnemonic: {mnemonic_value}")
-                lines.append(f"wif: {wif_value}")
-                lines.append(f"derivation_path: {derivation_path}")
-                if index_value is not None:
-                    lines.append(f"index: {index_value}")
-                exported_secrets += 1
-            except (InvalidToken, Exception):
-                lines.append("mnemonic: НЕ УДАЛОСЬ РАСШИФРОВАТЬ")
-                lines.append("wif: НЕ УДАЛОСЬ РАСШИФРОВАТЬ")
-        else:
-            lines.append("mnemonic: НЕ СОХРАНЕНО — PIN не был установлен при создании")
-            lines.append("wif: НЕ СОХРАНЕНО — PIN не был установлен при создании")
-        lines.append("")
+        if not token:
+            continue
+        try:
+            secret_data = decrypt_json(str(token))
+            wif = str(secret_data.get("wif") or "").strip()
+            if wif:
+                lines.append(wif)
+        except (InvalidToken, Exception):
+            continue
 
-    lines.append(f"Расшифровано seed/WIF: {exported_secrets} из {len(items)}")
-    return "\n".join(lines), ""
+    if not lines:
+        return None, "В последних записях нет сохранённых WIF. Установи PIN до генерации новых ключей."
+    return "\n".join(lines) + "\n", ""
 
+
+def send_export_all(chat_id: int) -> None:
+    export_text, error_text = build_wallet_export_text(chat_id, None)
+    if error_text:
+        bot.send_message(chat_id, error_text, reply_markup=main_keyboard(chat_id))
+        return
+
+    export_count = len([line for line in export_text.splitlines() if line.strip()])
+    filename = f"private_keys_wif_{export_count}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    file_obj = io.BytesIO(export_text.encode("utf-8"))
+    file_obj.name = filename
+    bot.send_document(
+        chat_id,
+        file_obj,
+        caption=(
+            f"📋 TXT-экспорт готов: {export_count} приватных ключей WIF.\n"
+            "Формат: один приватный ключ в строке.\n"
+            "⚠️ WIF даёт полный доступ к средствам. Храни файл офлайн и никому не отправляй.\n\n"
+            "Для массовой проверки баланса загружай TXT только с публичными адресами, без приватных ключей."
+        ),
+        reply_markup=main_keyboard(chat_id),
+    )
 
 def request_export_all_pin(message) -> None:
     if not chat_has_pin(message.chat.id):
         return ask_set_pin(message)
+    if is_chat_unlocked(message.chat.id):
+        return send_export_all(message.chat.id)
     sent = bot.send_message(
         message.chat.id,
-        f"🔐 Введи PIN-код из {PIN_LEN} цифр, чтобы вывести последние {BATCH_WALLET_COUNT} кошельков прямо сообщениями в Telegram:",
+        f"🔐 Введи PIN-код из {PIN_LEN} цифр один раз за эту сессию, чтобы получить TXT-файл с приватными ключами WIF:",
         reply_markup=main_keyboard(message.chat.id),
     )
     bot.register_next_step_handler(sent, export_all_after_pin)
@@ -596,29 +729,11 @@ def split_text_for_telegram(text: str, max_chars: int = TELEGRAM_COPY_CHUNK_SIZE
 
 def export_all_after_pin(message) -> None:
     pin = (message.text or "").strip()
-    export_text, error_text = build_wallet_export_text(message.chat.id, pin)
-    if error_text:
-        bot.send_message(message.chat.id, error_text, reply_markup=main_keyboard(message.chat.id))
+    if not verify_chat_pin(message.chat.id, pin):
+        bot.send_message(message.chat.id, "❌ Неверный PIN.", reply_markup=main_keyboard(message.chat.id))
         return
-
-    export_count = min(BATCH_WALLET_COUNT, len(history.get(str(message.chat.id)) or []))
-    chunks = split_text_for_telegram(export_text)
-    bot.send_message(
-        message.chat.id,
-        f"📋 Экспорт готов: последние {export_count} кошельков. Отправляю текстом в Telegram: {len(chunks)} частей.\n"
-        "⚠️ В сообщениях будут seed-фразы и WIF. Копируй и храни их офлайн.",
-        reply_markup=main_keyboard(message.chat.id),
-    )
-    for index, chunk in enumerate(chunks, start=1):
-        header = f"📋 Копировать всё — часть {index}/{len(chunks)}\n\n"
-        bot.send_message(
-            message.chat.id,
-            header + chunk,
-            parse_mode=None,
-            disable_web_page_preview=True,
-        )
-        time.sleep(0.15)
-    bot.send_message(message.chat.id, "✅ Экспорт в чат завершён.", reply_markup=main_keyboard(message.chat.id))
+    unlock_chat(message.chat.id)
+    send_export_all(message.chat.id)
 
 
 # ---------- PIN handlers ----------
@@ -638,9 +753,11 @@ def set_pin_cmd(message):
         bot.send_message(message.chat.id, "❌ PIN должен быть ровно 5 цифр.", reply_markup=main_keyboard(message.chat.id))
         return
     set_chat_pin(message.chat.id, pin)
+    unlock_chat(message.chat.id)
     bot.send_message(
         message.chat.id,
-        "✅ PIN установлен. Теперь новые кошельки будут сохраняться в историю вместе со словами/WIF.\n\n"
+        "✅ PIN установлен и разблокирован для текущей сессии. Теперь приватные ключи новых кошельков будут сохраняться в зашифрованную историю.\n\n"
+        "После перезапуска бота PIN потребуется ввести снова.\n"
         "⚠️ 5 цифр — слабая защита. Не храни там кошельки с деньгами.",
         reply_markup=main_keyboard(message.chat.id),
     )
@@ -650,7 +767,7 @@ def ask_set_pin(message) -> None:
     bot.send_message(
         message.chat.id,
         "🔐 Для истории с ключами задай PIN из 5 цифр:\n<code>/set_pin 12345</code>\n\n"
-        "После установки PIN бот будет сохранять в историю: слова, адрес, WIF, баланс.",
+        "После установки PIN бот будет сохранять ключи в историю, а экспорт выдаст TXT: один WIF в строке.",
         reply_markup=main_keyboard(message.chat.id),
     )
 
@@ -658,7 +775,9 @@ def ask_set_pin(message) -> None:
 def request_history_pin(message) -> None:
     if not chat_has_pin(message.chat.id):
         return ask_set_pin(message)
-    sent = bot.send_message(message.chat.id, "🔐 Введи PIN-код из 5 цифр для просмотра истории:")
+    if is_chat_unlocked(message.chat.id):
+        return show_history(message.chat.id, include_secrets=True)
+    sent = bot.send_message(message.chat.id, "🔐 Введи PIN-код из 5 цифр один раз за эту сессию для просмотра истории:")
     bot.register_next_step_handler(sent, show_history_after_pin)
 
 
@@ -667,6 +786,7 @@ def show_history_after_pin(message) -> None:
     if not verify_chat_pin(message.chat.id, pin):
         bot.send_message(message.chat.id, "❌ Неверный PIN.", reply_markup=main_keyboard(message.chat.id))
         return
+    unlock_chat(message.chat.id)
     show_history(message.chat.id, include_secrets=True)
 
 
@@ -682,7 +802,10 @@ def start(message):
         "✅ История с ключами открывается только по PIN из 5 цифр.\n"
         f"✅ Пакетный режим создаёт сразу {BATCH_WALLET_COUNT} новых кошельков.\n"
         f"✅ /scan1000 проверяет первые {BATCH_WALLET_COUNT} адресов из твоей seed-фразы для восстановления (/scan100 тоже работает).\n"
-        f"✅ Кнопка 📋 Копировать всё выводит последние {BATCH_WALLET_COUNT} кошельков сообщениями в Telegram после PIN.\n\n"
+        "✅ PIN вводится один раз за сессию: история и экспорт больше не спрашивают его после разблокировки.\n"
+        "✅ Кнопка 🔑 Приват ключ ВКЛ/ВЫКЛ включает режим генерации/экспорта только WIF.\n"
+        f"✅ Кнопка 📋 Копировать всё отправляет TXT-файл: один WIF в строке по последним {BATCH_WALLET_COUNT} ключам после PIN.\n"
+        "✅ Загруженный TXT со списком публичных адресов проверяется на положительный баланс без обработки приватных ключей.\n\n"
         "⚠️ Фразы из одинаковых слов небезопасны и подходят только для тестов/экспериментов.",
         reply_markup=main_keyboard(message.chat.id),
     )
@@ -702,7 +825,9 @@ def help_cmd(message):
         "• 🔄 Баланс последнего — обновить баланс последней записи\n"
         "• 💰 Положительный баланс — временный RAM-список найденных адресов с балансом > 0\n"
         f"• ⚙️ Пакет: ВКЛ/ВЫКЛ — когда включено, 🎲 12 слов и 🎲 24 слова создают сразу {BATCH_WALLET_COUNT} кошельков без автосканирования баланса\n"
-        f"• 📋 Копировать всё — после PIN вывести в Telegram последние {BATCH_WALLET_COUNT} кошельков/seed/WIF\n"
+        "• 🔑 Приват ключ ВКЛ/ВЫКЛ — в режиме ВКЛ новые генерации создают random private key → WIF без вывода seed-фраз\n"
+        f"• 📋 Копировать всё — после PIN отправить TXT-файл: один WIF в строке по последним {BATCH_WALLET_COUNT} ключам\n"
+        "• 📤 Загрузка TXT со списком адресов — проверить до 1000 публичных адресов на положительный баланс; файлы с приватными ключами не принимаются\n"
         f"• /scan1000 seed words — проверить первые {BATCH_WALLET_COUNT} адресов из твоей seed-фразы (/scan100 тоже работает)\n"
         "• /set_pin 12345 — задать PIN из 5 цифр\n\n"
         f"Путь деривации: {code(DERIVATION_PATH)}\n"
@@ -802,6 +927,165 @@ def scan100_cmd(message):
     scan_owned_mnemonic_100(message.chat.id, mnemonic_phrase)
 
 
+# ---------- address-only TXT balance check ----------
+
+BITCOIN_ADDRESS_RE = re.compile(
+    r"(?<![A-Za-z0-9])((?:[13][a-km-zA-HJ-NP-Z1-9]{25,34})|(?:bc1[ac-hj-np-z02-9]{11,71}))(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+WIF_RE = re.compile(r"(?<![A-Za-z0-9])([5KL][1-9A-HJ-NP-Za-km-z]{50,51})(?![A-Za-z0-9])")
+PRIVATE_WALLET_MARKERS = (
+    "mnemonic:",
+    "wif:",
+    "seed:",
+    "private_key",
+    "private key",
+    "xprv",
+    "yprv",
+    "zprv",
+)
+
+
+def parse_addresses_from_text(text: str) -> list[str]:
+    seen: set[str] = set()
+    addresses: list[str] = []
+    for match in BITCOIN_ADDRESS_RE.finditer(text):
+        address = match.group(1).strip()
+        key = address.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        addresses.append(address)
+        if len(addresses) >= BATCH_WALLET_COUNT:
+            break
+    return addresses
+
+
+def parse_wifs_from_text(text: str) -> list[str]:
+    seen: set[str] = set()
+    wifs: list[str] = []
+    for match in WIF_RE.finditer(text):
+        wif = match.group(1).strip()
+        if wif in seen:
+            continue
+        seen.add(wif)
+        wifs.append(wif)
+        if len(wifs) >= BATCH_WALLET_COUNT:
+            break
+    return wifs
+
+
+def contains_private_wallet_data(text: str) -> bool:
+    lower_text = text.lower()
+    return bool(parse_wifs_from_text(text)) or any(marker in lower_text for marker in PRIVATE_WALLET_MARKERS)
+
+
+def scan_uploaded_address_file(chat_id: int, addresses: list[str]) -> None:
+    bot.send_message(
+        chat_id,
+        f"🔎 Начинаю проверку адресов из TXT: {len(addresses)} шт.\n"
+        "Проверяются только публичные адреса; приватные ключи не сохраняются и не обрабатываются.",
+        reply_markup=main_keyboard(chat_id),
+    )
+
+    positive_records: list[dict[str, Any]] = []
+    api_errors = 0
+    for index, address in enumerate(addresses, start=1):
+        balance = get_balance(address)
+        if str(balance).startswith("не удалось"):
+            api_errors += 1
+        if parse_balance_btc(balance) > 0:
+            record: dict[str, Any] = {
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "type": "Address file scan",
+                "address": address,
+                "balance": balance,
+                "derivation_path": "address-only file",
+                "index": index,
+            }
+            positive_records.append(record)
+            remember_positive_wallet(chat_id, record)
+        if index % 100 == 0 and index < len(addresses):
+            bot.send_message(chat_id, f"🔎 Проверено {index}/{len(addresses)} адресов…")
+        time.sleep(0.2)
+
+    if positive_records:
+        lines = [
+            "BTC Wallet Bot — адреса с положительным балансом",
+            f"Дата проверки: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Проверено адресов: {len(addresses)}",
+            f"Найдено с балансом > 0: {len(positive_records)}",
+            "",
+        ]
+        for item in positive_records:
+            lines.append(f"address: {item['address']}")
+            lines.append(f"balance: {item['balance']}")
+            lines.append(f"checked_at: {item['date']}")
+            lines.append("")
+        result_text = "\n".join(lines)
+        result_file = io.BytesIO(result_text.encode("utf-8"))
+        result_file.name = f"positive_balances_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+
+        shown = []
+        for item in positive_records[:10]:
+            shown.append(f"🏠 {code(item['address'])}\n💰 <b>{esc(item['balance'])}</b>")
+        extra = "" if len(positive_records) <= 10 else f"\n…и ещё {len(positive_records) - 10}."
+        bot.send_message(
+            chat_id,
+            f"✅ Проверено адресов: {len(addresses)}.\n"
+            f"💰 Найдено с балансом > 0: <b>{len(positive_records)}</b>.\n"
+            "Список добавлен в RAM-кнопку «Положительный баланс» до перезапуска бота.\n\n"
+            + "\n\n".join(shown) + extra,
+            reply_markup=main_keyboard(chat_id),
+        )
+        bot.send_document(chat_id, result_file, caption="💰 TXT со списком адресов с положительным балансом.")
+    else:
+        err_line = f"\n⚠️ Ошибки API при проверке: {api_errors}." if api_errors else ""
+        bot.send_message(
+            chat_id,
+            f"✅ Проверено адресов: {len(addresses)}.\n"
+            "💰 Адресов с балансом > 0 не найдено."
+            f"{err_line}",
+            reply_markup=main_keyboard(chat_id),
+        )
+
+
+@bot.message_handler(content_types=["document"])
+def handle_document_upload(message):
+    doc = message.document
+    filename = (doc.file_name or "").lower()
+    if not filename.endswith((".txt", ".csv")):
+        bot.send_message(message.chat.id, "📤 Загрузи TXT/CSV со списком публичных BTC-адресов, по одному адресу в строке.", reply_markup=main_keyboard(message.chat.id))
+        return
+    if doc.file_size and doc.file_size > MAX_UPLOAD_FILE_BYTES:
+        bot.send_message(message.chat.id, f"❌ Файл слишком большой. Максимум: {MAX_UPLOAD_FILE_BYTES // 1000} KB.", reply_markup=main_keyboard(message.chat.id))
+        return
+
+    try:
+        file_info = bot.get_file(doc.file_id)
+        raw = bot.download_file(file_info.file_path)
+        text = raw.decode("utf-8-sig", errors="replace")
+    except Exception as exc:
+        bot.send_message(message.chat.id, f"❌ Не удалось прочитать файл: {code(type(exc).__name__)}", reply_markup=main_keyboard(message.chat.id))
+        return
+
+    if contains_private_wallet_data(text):
+        bot.send_message(
+            message.chat.id,
+            "⚠️ Этот файл содержит приватные данные: WIF/private-key или seed.\n\n"
+            "Я не проверяю баланс по спискам приватных ключей. Для массовой проверки загрузи отдельный TXT/CSV только с публичными BTC-адресами, без WIF/seed.",
+            reply_markup=main_keyboard(message.chat.id),
+        )
+        return
+
+    addresses = parse_addresses_from_text(text)
+    if not addresses:
+        bot.send_message(message.chat.id, "❌ В файле не нашёл BTC-адресов. Формат: один публичный адрес в строке.", reply_markup=main_keyboard(message.chat.id))
+        return
+
+    scan_uploaded_address_file(message.chat.id, addresses)
+
+
 @bot.message_handler(func=lambda m: True)
 def handle(message):
     text = (message.text or "").strip()
@@ -814,27 +1098,54 @@ def handle(message):
         return bot.send_message(
             message.chat.id,
             f"⚙️ Пакетный режим: <b>{status}</b>.\n"
-            f"Когда режим включён, кнопки 🎲 12 слов и 🎲 24 слова создают сразу {BATCH_WALLET_COUNT} новых кошельков и сохраняют их в PIN-историю.",
+            f"Когда режим включён, кнопки генерации создают сразу {BATCH_WALLET_COUNT} записей и сохраняют их в PIN-историю.",
+            reply_markup=main_keyboard(message.chat.id),
+        )
+
+    if text in {"🔑 Приват ключ: ВКЛ", "🔑 Приват ключ: ВЫКЛ", "приват ключ", "private key"}:
+        enabled = toggle_private_key_mode_enabled(message.chat.id)
+        status = "ВКЛ" if enabled else "ВЫКЛ"
+        return bot.send_message(
+            message.chat.id,
+            f"🔑 Режим приватного ключа: <b>{status}</b>.\n"
+            "Когда режим включён, кнопки генерации создают random private key → WIF, без вывода seed-фраз. "
+            "Экспорт «Копировать всё» выдаёт TXT: один WIF в строке.",
             reply_markup=main_keyboard(message.chat.id),
         )
 
     if text in {"🎲 12 слов", "🎲 Случайный 12", "12 слов"}:
+        if is_private_key_mode_enabled(message.chat.id):
+            if is_batch_enabled(message.chat.id):
+                return process_batch_private_keys(message.chat.id)
+            return process_random_private_key(message.chat.id)
         if is_batch_enabled(message.chat.id):
             return process_batch_wallets(message.chat.id, "Random 12")
         mnemonic_phrase = mnemo.generate(strength=128)
         return process_mnemonic(message.chat.id, mnemonic_phrase, True, source_type="Random 12")
 
     if text in {"🎲 24 слова", "🎲 Случайный 24", "24 слова"}:
+        if is_private_key_mode_enabled(message.chat.id):
+            if is_batch_enabled(message.chat.id):
+                return process_batch_private_keys(message.chat.id)
+            return process_random_private_key(message.chat.id)
         if is_batch_enabled(message.chat.id):
             return process_batch_wallets(message.chat.id, "Random 24")
         mnemonic_phrase = mnemo.generate(strength=256)
         return process_mnemonic(message.chat.id, mnemonic_phrase, True, source_type="Random 24")
 
     if text in {"🎯 Рандом12 одинаковые", "рандом12", "random12"}:
+        if is_private_key_mode_enabled(message.chat.id):
+            if is_batch_enabled(message.chat.id):
+                return process_batch_private_keys(message.chat.id)
+            return process_random_private_key(message.chat.id)
         mnemonic_phrase = same_word_mnemonic(12)
         return process_mnemonic(message.chat.id, mnemonic_phrase, True, source_type="SameWord 12")
 
     if text in {"🎯 Рандом24 одинаковые", "рандом24", "random24"}:
+        if is_private_key_mode_enabled(message.chat.id):
+            if is_batch_enabled(message.chat.id):
+                return process_batch_private_keys(message.chat.id)
+            return process_random_private_key(message.chat.id)
         mnemonic_phrase = same_word_mnemonic(24)
         return process_mnemonic(message.chat.id, mnemonic_phrase, True, source_type="SameWord 24")
 
@@ -898,25 +1209,29 @@ def process_mnemonic(chat_id: int, mnemonic_phrase: str, is_random: bool, checks
         remember_positive_wallet(chat_id, record)
         save_history()
 
-        checksum_line = "✅ BIP39 checksum: OK" if checksum_ok else "⚠️ BIP39 checksum: неверный, но адрес создан из введённых слов"
         save_line = (
-            "🔐 История: слова/WIF сохранены, просмотр только по PIN."
+            "🔐 История: WIF сохранён, просмотр только по PIN."
             if secrets_saved
             else "⚠️ PIN не установлен — в историю сохранены только адрес и баланс. Нажми 🔐 Установить PIN."
         )
-        bot.send_message(
-            chat_id,
-            "✅ <b>Кошелёк создан!</b>\n\n"
-            f"📝 Слова:\n{code(mnemonic_phrase)}\n\n"
-            f"🏠 Адрес P2PKH:\n{code(address)}\n\n"
-            f"🔑 WIF:\n{code(wif)}\n\n"
-            f"📍 Derivation path: {code(DERIVATION_PATH)}\n"
-            f"{esc(checksum_line)}\n"
-            f"💰 Баланс: <b>{esc(balance)}</b>\n\n"
-            f"{esc(save_line)}\n"
-            "⚠️ Фразы из одинаковых слов крайне небезопасны. Не пополняй такие кошельки.",
-            reply_markup=main_keyboard(chat_id),
-        )
+        if is_private_key_mode_enabled(chat_id):
+            response_text = (
+                "✅ <b>Кошелёк создан!</b>\n\n"
+                f"🔑 Приватный ключ WIF:\n{code(wif)}\n\n"
+                f"💰 Баланс: <b>{esc(balance)}</b>\n\n"
+                f"{esc(save_line)}\n"
+                "⚠️ Приватный ключ даёт полный доступ к кошельку. Никому его не отправляй."
+            )
+        else:
+            response_text = (
+                "✅ <b>Кошелёк создан!</b>\n\n"
+                f"🏠 Публичный адрес:\n{code(address)}\n\n"
+                f"🔑 Приватный ключ WIF:\n{code(wif)}\n\n"
+                f"💰 Баланс: <b>{esc(balance)}</b>\n\n"
+                f"{esc(save_line)}\n"
+                "⚠️ Приватный ключ даёт полный доступ к кошельку. Никому его не отправляй."
+            )
+        bot.send_message(chat_id, response_text, reply_markup=main_keyboard(chat_id))
     except Exception as e:
         bot.send_message(chat_id, f"❌ Ошибка создания: {code(str(e))}", reply_markup=main_keyboard(chat_id))
 
@@ -928,22 +1243,20 @@ def show_history(chat_id: int, include_secrets: bool = False):
 
     lines = ["📜 <b>Последние кошельки:</b>", ""]
     for index, w in enumerate(reversed(items[-10:]), start=1):
-        checksum = "OK" if w.get("checksum_ok", True) else "WARN"
-        lines.append(f"<b>#{index}</b> {esc(w.get('date', '?'))} | {esc(w.get('type', '?'))} | checksum {checksum}")
-        lines.append(f"🏠 {code(w.get('address', '?'))}")
-        lines.append(f"💰 {esc(w.get('balance', '?'))}")
+        lines.append(f"<b>#{index}</b>")
+        if not is_private_key_mode_enabled(chat_id):
+            lines.append(f"🏠 Публичный адрес: {code(w.get('address', '?'))}")
         if include_secrets:
             token = w.get("secret")
             if token:
                 try:
                     secret_data = decrypt_json(str(token))
-                    lines.append(f"📝 {code(secret_data.get('mnemonic', '?'))}")
-                    lines.append(f"🔑 WIF: {code(secret_data.get('wif', '?'))}")
-                    lines.append(f"📍 {code(secret_data.get('derivation_path', DERIVATION_PATH))}")
+                    lines.append(f"🔑 Приватный ключ WIF: {code(secret_data.get('wif', '?'))}")
                 except (InvalidToken, Exception):
-                    lines.append("⚠️ Ключи не удалось расшифровать.")
+                    lines.append("⚠️ Приватный ключ не удалось расшифровать.")
             else:
-                lines.append("⚠️ В этой старой записи ключи не сохранены: PIN тогда не был установлен.")
+                lines.append("⚠️ Приватный ключ не сохранён: PIN не был установлен при создании.")
+        lines.append(f"💰 Баланс: {esc(w.get('balance', '?'))}")
         lines.append("")
     bot.send_message(chat_id, "\n".join(lines), reply_markup=main_keyboard(chat_id))
 
