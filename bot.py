@@ -6,7 +6,7 @@ from datetime import datetime
 import requests
 from mnemonic import Mnemonic
 from hdwallet import HDWallet
-from hdwallet.cryptocurrencies import Bitcoin  # ← Важно!
+from hdwallet.cryptocurrencies import Bitcoin  # ← Класс Bitcoin
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
@@ -75,7 +75,7 @@ def handle(message):
 
 def process_mnemonic(chat_id, mnemonic, is_random):
     try:
-        # Новый способ инициализации
+        # Правильная инициализация для новой версии hdwallet
         wallet = HDWallet(cryptocurrency=Bitcoin)
         wallet.from_mnemonic(mnemonic=mnemonic)
         
