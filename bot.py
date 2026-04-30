@@ -42,9 +42,13 @@ MAX_HISTORY_PER_CHAT = 30000
 BATCH_WALLET_COUNT = 10000
 TELEGRAM_COPY_CHUNK_SIZE = 3600
 MAX_UPLOAD_FILE_BYTES = 1_000_000
-# Ускорение безопасной проверки работает только для загруженных/введённых публичных адресов.
-BALANCE_SCAN_WORKERS = max(1, min(32, int(os.getenv("BALANCE_SCAN_WORKERS", "12"))))
-BALANCE_REQUEST_TIMEOUT = max(3, min(30, int(os.getenv("BALANCE_REQUEST_TIMEOUT", "8"))))
+# Ускорение безопасной проверки работает только для загруженных/введённых public.txt/TXT/CSV.
+# Максимальный быстрый режим: BlockCypher batch до 100 адресов за 1 HTTP-запрос.
+BALANCE_SCAN_WORKERS = max(1, min(128, int(os.getenv("BALANCE_SCAN_WORKERS", "48"))))
+BALANCE_BATCH_WORKERS = max(1, min(32, int(os.getenv("BALANCE_BATCH_WORKERS", "16"))))
+BALANCE_BATCH_SIZE = max(1, min(100, int(os.getenv("BALANCE_BATCH_SIZE", "100"))))
+BALANCE_REQUEST_TIMEOUT = max(1, min(30, int(os.getenv("BALANCE_REQUEST_TIMEOUT", "5"))))
+BLOCKCYPHER_TOKEN = os.getenv("BLOCKCYPHER_TOKEN", "").strip()
 PIN_LEN = 5
 PIN_HASH_ITERATIONS = 240_000
 
@@ -58,6 +62,8 @@ session_positive_wallets: dict[str, list[dict[str, Any]]] = {}
 session_unlocked_chats: set[str] = set()
 # Счётчик проверенных публичных адресов хранится только в RAM и очищается после перезапуска бота.
 session_checked_counters: dict[str, int] = {}
+# Состояние настройки ускоренной проверки public.txt через Telegram.
+session_public_scan_setting_wait: dict[str, str] = {}
 
 
 # ---------- storage ----------
@@ -121,7 +127,80 @@ def get_chat_settings(chat_id: int) -> dict[str, Any]:
         settings[chat_key] = rec
     rec.setdefault("batch_enabled", False)
     rec.setdefault("private_key_only_enabled", False)
+    # Эти параметры относятся только к ускоренной проверке загруженного public.txt/TXT/CSV.
+    # Значения из Railway используются как дефолт, но дальше их можно менять прямо в Telegram.
+    rec.setdefault("public_scan_batch_size", BALANCE_BATCH_SIZE)
+    rec.setdefault("public_scan_batch_workers", BALANCE_BATCH_WORKERS)
+    rec.setdefault("public_scan_fallback_workers", BALANCE_SCAN_WORKERS)
+    rec.setdefault("public_scan_timeout", BALANCE_REQUEST_TIMEOUT)
     return rec
+
+
+PUBLIC_SCAN_SETTING_LIMITS = {
+    "public_scan_batch_size": (1, 100),
+    "public_scan_batch_workers": (1, 32),
+    "public_scan_fallback_workers": (1, 128),
+    "public_scan_timeout": (1, 30),
+}
+
+PUBLIC_SCAN_SETTING_LABELS = {
+    "public_scan_batch_size": "📦 Batch size",
+    "public_scan_batch_workers": "🧵 Batch workers",
+    "public_scan_fallback_workers": "🔁 Fallback workers",
+    "public_scan_timeout": "⏱ Timeout",
+}
+
+
+def clamp_int(value: Any, min_value: int, max_value: int, default: int) -> int:
+    try:
+        number = int(str(value).strip())
+    except Exception:
+        number = default
+    return max(min_value, min(max_value, number))
+
+
+def get_public_scan_settings(chat_id: int) -> dict[str, int]:
+    rec = get_chat_settings(chat_id)
+    values = {
+        "batch_size": clamp_int(rec.get("public_scan_batch_size"), 1, 100, BALANCE_BATCH_SIZE),
+        "batch_workers": clamp_int(rec.get("public_scan_batch_workers"), 1, 32, BALANCE_BATCH_WORKERS),
+        "fallback_workers": clamp_int(rec.get("public_scan_fallback_workers"), 1, 128, BALANCE_SCAN_WORKERS),
+        "timeout": clamp_int(rec.get("public_scan_timeout"), 1, 30, BALANCE_REQUEST_TIMEOUT),
+    }
+    rec["public_scan_batch_size"] = values["batch_size"]
+    rec["public_scan_batch_workers"] = values["batch_workers"]
+    rec["public_scan_fallback_workers"] = values["fallback_workers"]
+    rec["public_scan_timeout"] = values["timeout"]
+    return values
+
+
+def set_public_scan_setting(chat_id: int, key: str, value: int) -> int:
+    if key not in PUBLIC_SCAN_SETTING_LIMITS:
+        raise ValueError("unknown public scan setting")
+    min_value, max_value = PUBLIC_SCAN_SETTING_LIMITS[key]
+    current = get_chat_settings(chat_id).get(key)
+    default = int(current if current is not None else min_value)
+    new_value = clamp_int(value, min_value, max_value, default)
+    get_chat_settings(chat_id)[key] = new_value
+    save_settings()
+    return new_value
+
+
+def set_public_scan_preset(chat_id: int, preset: str) -> None:
+    rec = get_chat_settings(chat_id)
+    if preset == "max":
+        rec["public_scan_batch_size"] = 100
+        rec["public_scan_batch_workers"] = 32
+        rec["public_scan_fallback_workers"] = 128
+        rec["public_scan_timeout"] = 5
+    elif preset == "safe":
+        rec["public_scan_batch_size"] = 100
+        rec["public_scan_batch_workers"] = 8
+        rec["public_scan_fallback_workers"] = 24
+        rec["public_scan_timeout"] = 8
+    else:
+        raise ValueError("unknown preset")
+    save_settings()
 
 
 def is_batch_enabled(chat_id: int) -> bool:
@@ -414,6 +493,7 @@ def main_keyboard(chat_id: int | None = None) -> types.ReplyKeyboardMarkup:
     markup.add("📝 Ввести mnemonic", "📜 История")
     markup.add("🔐 Установить PIN", "🔄 Баланс последнего")
     markup.add("📋 Копировать всё", "📤 Проверить public.txt")
+    markup.add("⚡ Настройки public.txt")
     if chat_id is not None and is_private_key_mode_enabled(chat_id):
         markup.add("🔑 Приват ключ: ВКЛ")
     else:
@@ -427,6 +507,85 @@ def main_keyboard(chat_id: int | None = None) -> types.ReplyKeyboardMarkup:
     else:
         markup.add("⚙️ Пакет: ВЫКЛ")
     return markup
+
+
+def public_scan_settings_keyboard() -> types.ReplyKeyboardMarkup:
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add("⚡ Public MAX", "🛡️ Public SAFE")
+    markup.add("📦 Batch size", "🧵 Batch workers")
+    markup.add("🔁 Fallback workers", "⏱ Timeout")
+    markup.add("↩️ Назад")
+    return markup
+
+
+def public_scan_settings_text(chat_id: int) -> str:
+    cfg = get_public_scan_settings(chat_id)
+    return (
+        "⚡ <b>Настройки ускоренной проверки public.txt</b>\n\n"
+        "Эти параметры используются только для загруженного public.txt/TXT/CSV с публичными BTC-адресами или HEX public-key.\n\n"
+        f"📦 Batch size: <b>{cfg['batch_size']}</b> адресов за 1 запрос. Диапазон: 1–100.\n"
+        f"🧵 Batch workers: <b>{cfg['batch_workers']}</b> параллельных batch-запросов. Диапазон: 1–32.\n"
+        f"🔁 Fallback workers: <b>{cfg['fallback_workers']}</b> потоков для одиночной проверки при сбое batch API. Диапазон: 1–128.\n"
+        f"⏱ Timeout: <b>{cfg['timeout']}</b> сек. Диапазон: 1–30.\n\n"
+        "Для максимальной скорости нажми <b>⚡ Public MAX</b>. Если начнутся ошибки API/лимиты — нажми <b>🛡️ Public SAFE</b>."
+    )
+
+
+def show_public_scan_settings(chat_id: int) -> None:
+    bot.send_message(chat_id, public_scan_settings_text(chat_id), reply_markup=public_scan_settings_keyboard())
+
+
+def ask_public_scan_setting(chat_id: int, key: str) -> None:
+    min_value, max_value = PUBLIC_SCAN_SETTING_LIMITS[key]
+    label = PUBLIC_SCAN_SETTING_LABELS[key]
+    session_public_scan_setting_wait[str(chat_id)] = key
+    bot.send_message(
+        chat_id,
+        f"{label}\nВведи число от <b>{min_value}</b> до <b>{max_value}</b>.",
+        reply_markup=public_scan_settings_keyboard(),
+    )
+
+
+def handle_public_scan_setting_value(message) -> bool:
+    chat_key = str(message.chat.id)
+    key = session_public_scan_setting_wait.get(chat_key)
+    if not key:
+        return False
+
+    text = (message.text or "").strip()
+    if text in {"↩️ Назад", "назад", "back"}:
+        session_public_scan_setting_wait.pop(chat_key, None)
+        bot.send_message(message.chat.id, "Главное меню.", reply_markup=main_keyboard(message.chat.id))
+        return True
+
+    if not re.fullmatch(r"\d{1,3}", text):
+        min_value, max_value = PUBLIC_SCAN_SETTING_LIMITS[key]
+        bot.send_message(
+            message.chat.id,
+            f"❌ Нужно число от <b>{min_value}</b> до <b>{max_value}</b>.",
+            reply_markup=public_scan_settings_keyboard(),
+        )
+        return True
+
+    min_value, max_value = PUBLIC_SCAN_SETTING_LIMITS[key]
+    value = int(text)
+    if value < min_value or value > max_value:
+        bot.send_message(
+            message.chat.id,
+            f"❌ Значение вне диапазона. Нужно от <b>{min_value}</b> до <b>{max_value}</b>.",
+            reply_markup=public_scan_settings_keyboard(),
+        )
+        return True
+
+    new_value = set_public_scan_setting(message.chat.id, key, value)
+    session_public_scan_setting_wait.pop(chat_key, None)
+    bot.send_message(
+        message.chat.id,
+        f"✅ {PUBLIC_SCAN_SETTING_LABELS[key]} установлено: <b>{new_value}</b>.",
+        reply_markup=public_scan_settings_keyboard(),
+    )
+    show_public_scan_settings(message.chat.id)
+    return True
 
 
 def esc(value: Any) -> str:
@@ -1158,6 +1317,75 @@ def get_balance_safe_for_batch(address: str) -> str:
         return f"не удалось получить баланс: {type(exc).__name__}"
 
 
+def chunks_by_size(items: list[Any], size: int) -> list[list[Any]]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def satoshi_to_btc_text(sat: int) -> str:
+    return f"{sat / 100000000:.8f} BTC"
+
+
+def get_balances_blockcypher_batch(addresses: list[str], *, request_timeout: int, fallback_workers: int) -> dict[str, str]:
+    """
+    Максимально быстрый путь для public.txt: BlockCypher batch до 100 адресов
+    за один HTTP-запрос. Если batch недоступен или часть адресов не вернулась,
+    для таких адресов используется прежний fallback по одному адресу.
+    """
+    if not addresses:
+        return {}
+
+    headers = {
+        "User-Agent": "BTC-Wallet-Telegram-Bot/3.2",
+        "Accept": "application/json",
+    }
+    joined = ";".join(addresses)
+    url = f"https://api.blockcypher.com/v1/btc/main/addrs/{joined}/balance"
+    params = {"token": BLOCKCYPHER_TOKEN} if BLOCKCYPHER_TOKEN else None
+
+    try:
+        r = requests.get(url, timeout=request_timeout, headers=headers, params=params)
+        if r.status_code != 200:
+            raise RuntimeError(f"BlockCypher HTTP {r.status_code}")
+
+        data = r.json()
+        if isinstance(data, dict):
+            rows = [data]
+        elif isinstance(data, list):
+            rows = data
+        else:
+            raise RuntimeError("BlockCypher bad JSON")
+
+        result: dict[str, str] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            address = str(row.get("address") or "").strip()
+            if not address:
+                continue
+            final_balance = row.get("final_balance")
+            if final_balance is None:
+                final_balance = int(row.get("balance") or 0) + int(row.get("unconfirmed_balance") or 0)
+            result[address] = satoshi_to_btc_text(int(final_balance or 0))
+
+        missing = [address for address in addresses if address not in result]
+        if missing:
+            with ThreadPoolExecutor(max_workers=min(fallback_workers, len(missing))) as fallback_executor:
+                future_to_address = {fallback_executor.submit(get_balance_safe_for_batch, address): address for address in missing}
+                for future in as_completed(future_to_address):
+                    result[future_to_address[future]] = future.result()
+
+        return result
+
+    except Exception:
+        # При сбое batch-запроса проверяем chunk старым способом, чтобы бот не зависал и не падал.
+        result: dict[str, str] = {}
+        with ThreadPoolExecutor(max_workers=min(fallback_workers, len(addresses))) as fallback_executor:
+            future_to_address = {fallback_executor.submit(get_balance_safe_for_batch, address): address for address in addresses}
+            for future in as_completed(future_to_address):
+                result[future_to_address[future]] = future.result()
+        return result
+
+
 def scan_uploaded_address_file(
     chat_id: int,
     addresses: list[str],
@@ -1165,12 +1393,15 @@ def scan_uploaded_address_file(
     source_name: str = "TXT",
     record_type: str = "Address file scan",
 ) -> None:
-    """Быстрая проверка только публичных адресов/публичных ключей из загруженного файла."""
+    """Максимально быстрая проверка только публичных адресов/публичных ключей из public.txt/TXT/CSV."""
     total = len(addresses)
+    cfg = get_public_scan_settings(chat_id)
     bot.send_message(
         chat_id,
-        f"🔎 Начинаю ускоренную проверку адресов из {esc(source_name)}: {total} шт.\n"
-        f"Потоков проверки: <b>{BALANCE_SCAN_WORKERS}</b>.\n"
+        f"🔎 Начинаю максимально ускоренную проверку адресов из {esc(source_name)}: {total} шт.\n"
+        f"Batch-размер: <b>{cfg['batch_size']}</b> адресов за запрос.\n"
+        f"Параллельных batch-запросов: <b>{cfg['batch_workers']}</b>.\n"
+        f"Fallback-потоков: <b>{cfg['fallback_workers']}</b>. Timeout: <b>{cfg['timeout']}</b> сек.\n"
         "Проверяются только публичные адреса; приватные ключи не сохраняются и не обрабатываются.",
         reply_markup=main_keyboard(chat_id),
     )
@@ -1179,53 +1410,70 @@ def scan_uploaded_address_file(
     api_errors = 0
     checked = 0
     milestones = public_scan_milestones(total)
+    pending_milestones = sorted(milestones)
 
-    with ThreadPoolExecutor(max_workers=BALANCE_SCAN_WORKERS) as executor:
-        future_to_address = {
-            executor.submit(get_balance_safe_for_batch, address): (index, address)
-            for index, address in enumerate(addresses, start=1)
+    indexed_addresses = list(enumerate(addresses, start=1))
+    chunks = chunks_by_size(indexed_addresses, cfg["batch_size"])
+
+    # Быстрый режим: batch-запросы вместо одиночных; параметры берутся из настроек Telegram.
+    with ThreadPoolExecutor(max_workers=min(cfg["batch_workers"], len(chunks) or 1)) as executor:
+        future_to_chunk = {
+            executor.submit(
+                get_balances_blockcypher_batch,
+                [address for _index, address in chunk],
+                request_timeout=cfg["timeout"],
+                fallback_workers=cfg["fallback_workers"],
+            ): chunk
+            for chunk in chunks
         }
-        for future in as_completed(future_to_address):
-            original_index, address = future_to_address[future]
-            balance = future.result()
-            checked += 1
-            increment_checked_counter(chat_id)
 
-            if str(balance).startswith("не удалось"):
-                api_errors += 1
+        for future in as_completed(future_to_chunk):
+            chunk = future_to_chunk[future]
+            try:
+                batch_balances = future.result()
+            except Exception as exc:
+                batch_balances = {address: f"не удалось получить баланс: {type(exc).__name__}" for _index, address in chunk}
 
-            if parse_balance_btc(balance) > 0:
-                record: dict[str, Any] = {
-                    "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "type": record_type,
-                    "address": address,
-                    "balance": balance,
-                    "derivation_path": f"address-only {source_name}",
-                    "index": original_index,
-                }
-                positive_records.append(record)
-                remember_positive_wallet(chat_id, record)
+            for original_index, address in chunk:
+                balance = batch_balances.get(address, "не удалось получить баланс: empty batch result")
+                checked += 1
+                increment_checked_counter(chat_id)
+
+                if str(balance).startswith("не удалось"):
+                    api_errors += 1
+
+                if parse_balance_btc(balance) > 0:
+                    record: dict[str, Any] = {
+                        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "type": record_type,
+                        "address": address,
+                        "balance": balance,
+                        "derivation_path": f"address-only {source_name}",
+                        "index": original_index,
+                    }
+                    positive_records.append(record)
+                    remember_positive_wallet(chat_id, record)
+                    bot.send_message(
+                        chat_id,
+                        "💰 <b>Положительный баланс найден</b>\n"
+                        f"🏠 {code(address)}\n"
+                        f"💰 <b>{esc(balance)}</b>\n"
+                        f"🔎 Проверено сейчас: {checked}/{total}",
+                        reply_markup=main_keyboard(chat_id),
+                    )
+
+            while pending_milestones and checked >= pending_milestones[0]:
+                milestone = pending_milestones.pop(0)
                 bot.send_message(
                     chat_id,
-                    "💰 <b>Положительный баланс найден</b>\n"
-                    f"🏠 {code(address)}\n"
-                    f"💰 <b>{esc(balance)}</b>\n"
-                    f"🔎 Проверено сейчас: {checked}/{total}",
+                    public_scan_progress_text(milestone, total, len(positive_records), chat_id),
                     reply_markup=main_keyboard(chat_id),
                 )
 
-            if checked in milestones:
-                bot.send_message(
-                    chat_id,
-                    public_scan_progress_text(checked, total, len(positive_records), chat_id),
-                    reply_markup=main_keyboard(chat_id),
-                )
-
-    # На случай, если из-за гонки/исключения финальный milestone не отправился.
-    if checked not in milestones:
+    if pending_milestones:
         bot.send_message(
             chat_id,
-            public_scan_progress_text(checked, total, len(positive_records), chat_id),
+            public_scan_progress_text(total, total, len(positive_records), chat_id),
             reply_markup=main_keyboard(chat_id),
         )
 
@@ -1274,7 +1522,6 @@ def scan_uploaded_address_file(
             reply_markup=main_keyboard(chat_id),
         )
 
-
 @bot.message_handler(content_types=["document"])
 def handle_document_upload(message):
     doc = message.document
@@ -1316,6 +1563,37 @@ def handle(message):
     text = (message.text or "").strip()
     if not text:
         return bot.reply_to(message, "Отправь текст или выбери кнопку.", reply_markup=main_keyboard(message.chat.id))
+
+    if handle_public_scan_setting_value(message):
+        return
+
+    if text in {"⚡ Настройки public.txt", "настройки public.txt", "public settings"}:
+        return show_public_scan_settings(message.chat.id)
+
+    if text in {"⚡ Public MAX", "public max"}:
+        set_public_scan_preset(message.chat.id, "max")
+        bot.send_message(message.chat.id, "✅ Включён профиль <b>Public MAX</b> для ускоренной проверки public.txt.", reply_markup=public_scan_settings_keyboard())
+        return show_public_scan_settings(message.chat.id)
+
+    if text in {"🛡️ Public SAFE", "public safe"}:
+        set_public_scan_preset(message.chat.id, "safe")
+        bot.send_message(message.chat.id, "✅ Включён профиль <b>Public SAFE</b> для проверки public.txt с меньшим риском лимитов API.", reply_markup=public_scan_settings_keyboard())
+        return show_public_scan_settings(message.chat.id)
+
+    if text == "📦 Batch size":
+        return ask_public_scan_setting(message.chat.id, "public_scan_batch_size")
+
+    if text == "🧵 Batch workers":
+        return ask_public_scan_setting(message.chat.id, "public_scan_batch_workers")
+
+    if text == "🔁 Fallback workers":
+        return ask_public_scan_setting(message.chat.id, "public_scan_fallback_workers")
+
+    if text == "⏱ Timeout":
+        return ask_public_scan_setting(message.chat.id, "public_scan_timeout")
+
+    if text in {"↩️ Назад", "назад", "back"}:
+        return bot.send_message(message.chat.id, "Главное меню.", reply_markup=main_keyboard(message.chat.id))
 
     if text in {"⚙️ Пакет: ВКЛ", "⚙️ Пакет: ВЫКЛ", "пакет", "batch"}:
         enabled = toggle_batch_enabled(message.chat.id)
@@ -1388,11 +1666,13 @@ def handle(message):
         return refresh_last_balance(message.chat.id)
 
     if text in {"📤 Проверить public.txt", "проверить public.txt", "check public.txt"}:
+        cfg = get_public_scan_settings(message.chat.id)
         return bot.send_message(
             message.chat.id,
             "📤 Загрузи сюда файл public.txt или CSV/TXT со списком публичных BTC-адресов, по одному адресу в строке.\n\n"
             f"Бот в ускоренном режиме проверит до {BATCH_WALLET_COUNT} публичных адресов, покажет прогресс на 5000/{BATCH_WALLET_COUNT} и {BATCH_WALLET_COUNT}/{BATCH_WALLET_COUNT}, а адреса с балансом > 0 покажет сразу в чате и сохранит в историю без приватных ключей. "
-            "Файлы private.txt/WIF/seed для проверки не принимаются. Если в TXT лежат HEX public-key, бот сконвертирует их в legacy P2PKH-адреса и проверит баланс.",
+            "Файлы private.txt/WIF/seed для проверки не принимаются. Если в TXT лежат HEX public-key, бот сконвертирует их в legacy P2PKH-адреса и проверит баланс.\n\n"
+            f"⚡ Текущие настройки: batch <b>{cfg['batch_size']}</b>, batch workers <b>{cfg['batch_workers']}</b>, fallback <b>{cfg['fallback_workers']}</b>, timeout <b>{cfg['timeout']} сек</b>. Изменить: кнопка «⚡ Настройки public.txt».",
             reply_markup=main_keyboard(message.chat.id),
         )
 
