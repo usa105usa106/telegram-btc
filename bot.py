@@ -22,19 +22,17 @@ else:
     history = {}
 
 mnemo = Mnemonic("english")
-
-# Получаем список всех 2048 слов
 bip39_words = set(mnemo.wordlist)
 
 def get_balance(address: str) -> str:
     try:
-        r = requests.get(f"https://api.blockchair.com/bitcoin/dashboards/address/{address}?limit=0", timeout=10)
+        r = requests.get(f"https://api.blockchair.com/bitcoin/dashboards/address/{address}", timeout=10)
         if r.status_code == 200:
             bal = r.json().get("data", {}).get(address, {}).get("address", {}).get("balance", 0)
             return f"{bal / 100000000:.8f} BTC"
-        return "API error"
     except:
-        return "Не удалось получить баланс"
+        pass
+    return "Не удалось получить баланс"
 
 def save_history():
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
@@ -45,41 +43,30 @@ def start(message):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add("🎲 12 слов", "🎲 24 слова")
     markup.add("📝 Ввести mnemonic", "📜 История")
-    bot.send_message(message.chat.id,
-        "👋 Bitcoin Wallet Bot\n\n"
-        "✅ Только слова из BIP39 (2048)\n"
-        "✅ Повторения разрешены\n"
-        "⚠️ Никому не показывай приватные ключи!",
-        reply_markup=markup)
-
-def generate_random_mnemonic(strength=128):
-    return mnemo.generate(strength=strength)
+    bot.send_message(message.chat.id, "👋 Bitcoin Wallet Bot\n\nПовторения разрешены ✅", reply_markup=markup)
 
 @bot.message_handler(func=lambda m: True)
 def handle(message):
     text = message.text.strip()
     if text in ["🎲 12 слов", "🎲 Случайный 12"]:
-        mnemonic = generate_random_mnemonic(128)
+        mnemonic = mnemo.generate(strength=128)
         process_mnemonic(message.chat.id, mnemonic, True)
     elif text in ["🎲 24 слова", "🎲 Случайный 24"]:
-        mnemonic = generate_random_mnemonic(256)
+        mnemonic = mnemo.generate(strength=256)
         process_mnemonic(message.chat.id, mnemonic, True)
     elif text == "📜 История":
         show_history(message.chat.id)
     elif text == "📝 Ввести mnemonic":
-        bot.send_message(message.chat.id, "Отправь 12 или 24 слова из BIP39 (повторения разрешены):")
+        bot.send_message(message.chat.id, "Отправь 12 или 24 слова (повторения разрешены):")
     else:
         words = text.split()
         if len(words) not in (12, 24):
-            bot.reply_to(message, "❌ Должно быть ровно 12 или 24 слова!")
-            return
+            return bot.reply_to(message, "❌ Должно быть 12 или 24 слова!")
         
-        # Проверка каждого слова по отдельности (повторения разрешены)
-        invalid = [w for w in words if w not in bip39_words]
+        # Проверка только по словарю (повторения ОК)
+        invalid = [w for w in words if w.lower() not in bip39_words]
         if invalid:
-            bot.reply_to(message, f"❌ Некоторые слова не из BIP39 (2048 слов)!\n"
-                                  f"Неверные: {invalid[:5]}...")
-            return
+            return bot.reply_to(message, f"❌ Неизвестные слова: {invalid[:3]}...\nИспользуй только из BIP39.")
         
         mnemonic = " ".join(words)
         process_mnemonic(message.chat.id, mnemonic, False)
@@ -95,9 +82,8 @@ def process_mnemonic(chat_id, mnemonic, is_random):
 
         if str(chat_id) not in history:
             history[str(chat_id)] = []
-        
         history[str(chat_id)].append({
-            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "type": "Random" if is_random else "Custom",
             "mnemonic": mnemonic,
             "address": address,
@@ -107,30 +93,29 @@ def process_mnemonic(chat_id, mnemonic, is_random):
         save_history()
 
         bot.send_message(chat_id, f"""
-✅ Кошелёк успешно создан!
+✅ Кошелёк создан!
 
-📝 Mnemonic ({len(mnemonic.split())} слов):
+📝 Слова:
 `{mnemonic}`
 
 🏠 Адрес:
 `{address}`
 
-🔑 WIF Private Key:
+🔑 WIF:
 `{wif}`
 
 💰 Баланс: {balance}
-        """, parse_mode="Markdown")
+""", parse_mode="Markdown")
     except Exception as e:
-        bot.send_message(chat_id, f"❌ Ошибка: {str(e)}")
+        bot.send_message(chat_id, f"❌ Ошибка создания: {str(e)}")
 
 def show_history(chat_id):
-    if str(chat_id) not in history or not history[str(chat_id)]:
-        bot.send_message(chat_id, "📭 История пуста.")
-        return
-    text = "📜 Последние 10 кошельков:\n\n"
-    for item in reversed(history[str(chat_id)][-10:]):
-        text += f"{item['date']} — {item['type']}\n`{item['address']}` — {item['balance']}\n\n"
-    bot.send_message(chat_id, text, parse_mode="Markdown")
+    if not history.get(str(chat_id)):
+        return bot.send_message(chat_id, "История пуста.")
+    txt = "📜 Последние кошельки:\n\n"
+    for w in reversed(history[str(chat_id)][-5:]):
+        txt += f"{w['date']} | {w['type']}\n`{w['address']}` | {w['balance']}\n\n"
+    bot.send_message(chat_id, txt, parse_mode="Markdown")
 
-print("🤖 Бот запущен (BIP39 + повторения разрешены)")
+print("🤖 Бот запущен")
 bot.infinity_polling()
