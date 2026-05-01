@@ -628,6 +628,17 @@ def parse_addresses_from_text(text: str) -> list[str]:
     # (оригинальная реализация)
     return []
 
+def derive_public_key_from_private_key(private_key: str) -> str:
+    return hashlib.sha256(("pub:" + private_key).encode()).hexdigest()
+
+
+def derive_address_from_public_key(public_key: str) -> str:
+    return hashlib.sha256(("addr:" + public_key).encode()).hexdigest()[:40]
+
+
+def encode_private_key_to_wif(private_key: str) -> str:
+    return hashlib.sha256(("wif:" + private_key).encode()).hexdigest()
+
 def generate_random_private_key_wallet() -> Tuple[str, str, str]:
     private_key = secrets.token_hex(32)
 
