@@ -621,14 +621,57 @@ def handle(message):
 
     # ... (остальные обработчики: генерация, история, настройки и т.д.)
 
-# ====================== MISSING FUNCTIONS (добавь в конец) ======================
-def parse_wifs_from_text(text: str) -> list[str]:
-    # (оставь оригинальную реализацию)
-    return []
+# ====================== CRYPTO FUNCTIONS ======================
+import ecdsa
+import hashlib
 
-def parse_addresses_from_text(text: str) -> list[str]:
-    # (оригинальная реализация)
-    return []
+def derive_public_key_from_private_key(private_key_hex: str) -> str:
+    """ECDSA Secp256k1 → Public Key (uncompressed)"""
+    sk = ecdsa.SigningKey.from_string(bytes.fromhex(private_key_hex), curve=ecdsa.SECP256k1)
+    vk = sk.verifying_key
+    return vk.to_string("uncompressed").hex()
+
+def ripemd160(data: bytes) -> bytes:
+    return hashlib.new('ripemd160', data).digest()
+
+def derive_address_from_public_key(public_key_hex: str) -> str:
+    """Bitcoin P2PKH адрес"""
+    pubkey_bytes = bytes.fromhex(public_key_hex)
+    sha256 = hashlib.sha256(pubkey_bytes).digest()
+    ripemd = ripemd160(sha256)
+    extended = b'\x00' + ripemd
+    checksum = hashlib.sha256(hashlib.sha256(extended).digest()).digest()[:4]
+    return base58_encode(extended + checksum)
+
+def encode_private_key_to_wif(private_key_hex: str) -> str:
+    """Private Key → WIF"""
+    private_bytes = bytes.fromhex(private_key_hex)
+    extended = b'\x80' + private_bytes
+    checksum = hashlib.sha256(hashlib.sha256(extended).digest()).digest()[:4]
+    return base58_encode(extended + checksum)
+
+def base58_encode(data: bytes) -> str:
+    """Base58 encoding"""
+    alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+    n = int.from_bytes(data, 'big')
+    res = []
+    while n:
+        n, r = divmod(n, 58)
+        res.append(alphabet[r])
+    for b in data:
+        if b == 0:
+            res.append(alphabet[0])
+        else:
+            break
+    return ''.join(reversed(res))
+
+# ====================== ГЛАВНАЯ ФУНКЦИЯ ======================
+def generate_random_private_key_wallet() -> Tuple[str, str, str]:
+    private_key = secrets.token_hex(32)
+    public_key = derive_public_key_from_private_key(private_key)
+    address = derive_address_from_public_key(public_key)
+    wif = encode_private_key_to_wif(private_key)
+    return private_key, address, wif
 
 def generate_random_private_key_wallet() -> Tuple[str, str, str]:
     private_key = secrets.token_hex(32)
