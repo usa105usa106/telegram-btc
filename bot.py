@@ -628,11 +628,14 @@ def parse_addresses_from_text(text: str) -> list[str]:
     # (оригинальная реализация)
     return []
 
-def generate_random_private_key_wallet() -> Tuple[str, str]:
-    # (оригинальная)
-    private_key = secrets.token_bytes(32)
-    # ... (полная реализация)
-    return address, wif
+def generate_random_private_key_wallet() -> Tuple[str, str, str]:
+    private_key = secrets.token_hex(32)
+
+    public_key = derive_public_key_from_private_key(private_key)
+    address = derive_address_from_public_key(public_key)
+    wif = encode_private_key_to_wif(private_key)
+
+    return private_key, address, wif
 
 def derive_bitcoin_wallet(mnemonic_phrase: str) -> Tuple[str, str]:
     # (оригинальная)
