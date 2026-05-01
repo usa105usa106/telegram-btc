@@ -621,12 +621,6 @@ def handle(message):
 
     # ... (остальные обработчики: генерация, история, настройки и т.д.)
 
-# ====================== START ======================
-if __name__ == "__main__":
-    print(f"🤖 Bitcoin Wallet Hunter Bot v{BOT_VERSION} запущен")
-    print(f"Data dir: {DATA_DIR}")
-    bot.infinity_polling(skip_pending=True, timeout=30)
-
 # ====================== MISSING FUNCTIONS (добавь в конец) ======================
 def parse_wifs_from_text(text: str) -> list[str]:
     # (оставь оригинальную реализацию)
