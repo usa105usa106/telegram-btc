@@ -461,12 +461,11 @@ def scan_uploaded_private_key_file(chat_id: int, wifs: list[str]):
         return send_ping(message.chat.id)
 
     if text in {"🔥 Auto Hunt: ВКЛ", "🔥 Auto Hunt: ВЫКЛ"}:
-        if is_auto_hunt_enabled(message.chat.id):
-            stop_auto_hunt(message.chat.id)
-        else:
-            toggle_auto_hunt(message.chat.id)
-            start_auto_hunt(message.chat.id)
-        return
+    if is_auto_hunt_enabled(message.chat.id):
+        stop_auto_hunt(message.chat.id)
+    else:
+        start_auto_hunt(message.chat.id)
+    return
 
     # ... (остальные обработчики кнопок)
 
@@ -594,16 +593,12 @@ def handle(message):
     if not text:
         return
 
-    if text in {"🏓 Ping", "ping"}:
-        return send_ping(message.chat.id)
-
     if text in {"🔥 Auto Hunt: ВКЛ", "🔥 Auto Hunt: ВЫКЛ"}:
-        if is_auto_hunt_enabled(message.chat.id):
-            stop_auto_hunt(message.chat.id)
-        else:
-            toggle_auto_hunt(message.chat.id)
-            start_auto_hunt(message.chat.id)
-        return
+    if is_auto_hunt_enabled(message.chat.id):
+        stop_auto_hunt(message.chat.id)
+    else:
+        start_auto_hunt(message.chat.id)
+    return
 
     if text == "📤 Positive Found":
         if POSITIVE_FOUND_FILE.exists() and POSITIVE_FOUND_FILE.stat().st_size > 0:
@@ -668,16 +663,50 @@ def show_checked_counter(chat_id: int):
 
 def stop_auto_hunt(chat_id: int):
     chat_key = str(chat_id)
+
     if chat_key in auto_hunt_stop_events:
         auto_hunt_stop_events[chat_key].set()
 
+    rec = get_chat_settings(chat_id)
+    rec["auto_hunt_enabled"] = False
+    save_settings()
+
+    bot.send_message(
+        chat_id,
+        "🛑 Auto Hunt остановлен.",
+        reply_markup=main_keyboard(chat_id),
+    )
+
+
 def start_auto_hunt(chat_id: int):
     chat_key = str(chat_id)
+
     if chat_key in auto_hunt_stop_events and not auto_hunt_stop_events[chat_key].is_set():
+        bot.send_message(
+            chat_id,
+            "🔥 Auto Hunt уже запущен.",
+            reply_markup=main_keyboard(chat_id),
+        )
         return
+
+    rec = get_chat_settings(chat_id)
+    rec["auto_hunt_enabled"] = True
+    save_settings()
+
     stop_event = threading.Event()
     auto_hunt_stop_events[chat_key] = stop_event
-    threading.Thread(target=auto_hunt_worker, args=(chat_id,), daemon=True).start()
+
+    bot.send_message(
+        chat_id,
+        "🔥 Auto Hunt запускается...",
+        reply_markup=main_keyboard(chat_id),
+    )
+
+    threading.Thread(
+        target=auto_hunt_worker,
+        args=(chat_id,),
+        daemon=True,
+    ).start()
 
 # ====================== ЗАПУСК ======================
 if __name__ == "__main__":
