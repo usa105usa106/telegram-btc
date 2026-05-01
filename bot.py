@@ -214,8 +214,6 @@ def send_ping(chat_id: int) -> None:
 
 # Если нужно — могу прислать следующие части кода (Part 2, Part 3 и т.д.).
 
-print(f"🤖 Бот запущен. Версия: {BOT_VERSION} | Auto Hunt + positive_found.txt", flush=True)
-bot.infinity_polling(skip_pending=True, timeout=30)
 
 # ====================== STORAGE ======================
 def load_json_file(path: Path, default: Any) -> Any:
@@ -360,7 +358,7 @@ def auto_hunt_worker(chat_id: int):
     bot.send_message(chat_id, "🛑 Auto Hunt остановлен.", reply_markup=main_keyboard(chat_id))
 
 # ====================== MAIN KEYBOARD ======================
-def main_keyboard(chat_id: int | None = None) -> types.ReplyKeyboardMarkup:
+
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add("🎲 12 слов", "🎲 24 слова")
     markup.add("🎯 Рандом12 одинаковые", "🎯 Рандом24 одинаковые")
@@ -373,7 +371,6 @@ def main_keyboard(chat_id: int | None = None) -> types.ReplyKeyboardMarkup:
     return markup
 
 # ====================== CONTINUE IN NEXT PART ======================
-print("Часть 2/6 загружена. Напиши 'Part 3' для продолжения.")
 
 # ====================== SCAN FUNCTIONS ======================
 def scan_uploaded_address_file(
@@ -455,8 +452,7 @@ def scan_uploaded_private_key_file(chat_id: int, wifs: list[str]):
     # ... (реализация по аналогии с public)
 
 # ====================== MAIN HANDLER ======================
-@bot.message_handler(func=lambda m: True)
-def handle(message):
+
     text = (message.text or "").strip()
     if not text:
         return
@@ -551,7 +547,6 @@ def process_batch_private_keys(chat_id: int):
         # Здесь можно запустить worker, если нужно
 
 # ====================== CONTINUE ======================
-print("Часть 4/6 загружена. Напиши 'Part 5' для продолжения.")
 
 # ====================== DOCUMENT HANDLER ======================
 @bot.message_handler(content_types=["document"])
@@ -624,12 +619,6 @@ def handle(message):
 
     # ... (остальные обработчики: генерация, история, настройки и т.д.)
 
-# ====================== START ======================
-if __name__ == "__main__":
-    print(f"🤖 Bitcoin Wallet Hunter Bot v{BOT_VERSION} запущен")
-    print(f"Data dir: {DATA_DIR}")
-    bot.infinity_polling(skip_pending=True, timeout=30)
-
 # ====================== MISSING FUNCTIONS (добавь в конец) ======================
 def parse_wifs_from_text(text: str) -> list[str]:
     # (оставь оригинальную реализацию)
@@ -678,10 +667,9 @@ def start_auto_hunt(chat_id: int):
 
 # ====================== ЗАПУСК ======================
 if __name__ == "__main__":
-    print(f"🤖 Bitcoin Wallet Hunter Bot v{BOT_VERSION} — ГОТОВ К РАБОТЕ")
-    print(f"Data: {DATA_DIR}")
-    print("Auto Hunt + positive_found.txt + упрощённая история")
+    print(f"🤖 Bitcoin Wallet Hunter Bot v{BOT_VERSION} — ГОТОВ К РАБОТЕ", flush=True)
+    print(f"Data: {DATA_DIR}", flush=True)
     try:
         bot.infinity_polling(skip_pending=True, timeout=30)
     except Exception as e:
-        print(f"Ошибка запуска: {e}")
+        print(f"Ошибка запуска: {e}", flush=True)
