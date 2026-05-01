@@ -580,7 +580,7 @@ def handle_document_upload(message):
 
 # ====================== HISTORY & PIN ======================
 def request_history_pin(message):
-    # ... (как было раньше)
+    pass
 
 # ====================== FINAL HANDLERS ======================
 @bot.message_handler(commands=["start"])
