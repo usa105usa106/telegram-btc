@@ -586,11 +586,11 @@ def request_history_pin(message):
 @bot.message_handler(commands=["start"])
 def start(message):
     bot.send_message(
-    message.chat.id,
-    "👋 <b>Bitcoin Wallet Hunter Bot v0010</b>\n\n"
-    "Auto Hunt + 1M ключей + positive_found.txt\n"
-    "Нажми 🔥 Auto Hunt для запуска",
-    reply_markup=main_keyboard(message.chat.id),
+        message.chat.id,
+        "👋 <b>Bitcoin Wallet Hunter Bot v0010</b>\n\n"
+        "Auto Hunt + 1M ключей + positive_found.txt\n"
+        "Нажми 🔥 Auto Hunt для запуска",
+        reply_markup=main_keyboard(message.chat.id),
     )
 
 @bot.message_handler(func=lambda m: True)
