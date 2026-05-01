@@ -214,9 +214,6 @@ def send_ping(chat_id: int) -> None:
 
 # Если нужно — могу прислать следующие части кода (Part 2, Part 3 и т.д.).
 
-print(f"🤖 Бот запущен. Версия: {BOT_VERSION} | Auto Hunt + positive_found.txt", flush=True)
-bot.infinity_polling(skip_pending=True, timeout=30)
-
 # ====================== STORAGE ======================
 def load_json_file(path: Path, default: Any) -> Any:
     if not path.exists():
@@ -501,7 +498,7 @@ def public_scan_settings_keyboard() -> types.ReplyKeyboardMarkup:
 
 # ====================== BUILD RECORDS (упрощённые) ======================
 def build_private_key_record(chat_id: int, source_type: str, balance: str = "не проверялся"):
-    address, wif = generate_random_private_key_wallet()
+    private_key, address, wif = generate_random_private_key_wallet()
     record = {
         "a": address,
         "b": balance,
@@ -580,7 +577,7 @@ def handle_document_upload(message):
 
 # ====================== HISTORY & PIN ======================
 def request_history_pin(message):
-    # ... (как было раньше)
+    pass
 
 # ====================== FINAL HANDLERS ======================
 @bot.message_handler(commands=["start"])
@@ -639,11 +636,14 @@ def parse_addresses_from_text(text: str) -> list[str]:
     # (оригинальная реализация)
     return []
 
-def generate_random_private_key_wallet() -> Tuple[str, str]:
-    # (оригинальная)
-    private_key = secrets.token_bytes(32)
-    # ... (полная реализация)
-    return address, wif
+def generate_random_private_key_wallet() -> Tuple[str, str, str]:
+    private_key = secrets.token_hex(32)
+
+    public_key = derive_public_key_from_private_key(private_key)
+    address = derive_address_from_public_key(public_key)
+    wif = encode_private_key_to_wif(private_key)
+
+    return private_key, address, wif
 
 def derive_bitcoin_wallet(mnemonic_phrase: str) -> Tuple[str, str]:
     # (оригинальная)
