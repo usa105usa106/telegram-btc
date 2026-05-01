@@ -372,6 +372,15 @@ def auto_hunt_worker(chat_id: int):
 
 # ====================== CONTINUE IN NEXT PART ======================
 
+def get_public_scan_settings(chat_id: int) -> dict:
+    rec = get_chat_settings(chat_id)
+    return {
+        "batch_size": rec.get("public_scan_batch_size", BALANCE_BATCH_SIZE),
+        "batch_workers": rec.get("public_scan_batch_workers", BALANCE_BATCH_WORKERS),
+        "fallback_workers": rec.get("public_scan_fallback_workers", BALANCE_SCAN_WORKERS),
+        "timeout": rec.get("public_scan_timeout", BALANCE_REQUEST_TIMEOUT),
+    }
+
 # ====================== SCAN FUNCTIONS ======================
 def scan_uploaded_address_file(
     chat_id: int,
