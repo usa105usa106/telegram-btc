@@ -41,7 +41,7 @@ SECRET_KEY_FILE = DATA_DIR / "history_secret.key"
 SETTINGS_FILE = DATA_DIR / "wallets_settings.json"
 POSITIVE_FOUND_FILE = DATA_DIR / "positive_found.txt"
 
-BATCH_WALLET_COUNT = 1_000_000
+BATCH_WALLET_COUNT = 500_000
 MAX_HISTORY_PER_CHAT = 2_000_000
 
 BALANCE_SCAN_WORKERS = max(1, min(512, int(os.getenv("BALANCE_SCAN_WORKERS", "128"))))
@@ -451,23 +451,66 @@ def scan_uploaded_private_key_file(chat_id: int, wifs: list[str]):
     bot.send_message(chat_id, f"🔐 Проверка {len(wifs):,} WIF...", reply_markup=main_keyboard(chat_id))
     # ... (реализация по аналогии с public)
 
-# ====================== MAIN HANDLER ======================
+# ====================== MAIN HANDLER (все кнопки) ======================
 @bot.message_handler(func=lambda m: True)
 def handle(message):
     text = (message.text or "").strip()
     if not text:
         return
 
-    if text in {"🏓 Ping", "ping"}:
-        return send_ping(message.chat.id)
+    chat_id = message.chat.id
 
-    if text in {"🔥 Auto Hunt: ВКЛ", "🔥 Auto Hunt: ВЫКЛ"}:
-        if is_auto_hunt_enabled(message.chat.id):
-            stop_auto_hunt(message.chat.id)
-        else:
-            toggle_auto_hunt(message.chat.id)
-            start_auto_hunt(message.chat.id)
+    # ==================== СИСТЕМНЫЕ ====================
+    if text in {"🏓 Ping", "ping"}:
+        return send_ping(chat_id)
+
+    if text in {"♻️ Рестарт", "restart"}:
+        bot.send_message(chat_id, "🔄 Перезапуск...", reply_markup=main_keyboard(chat_id))
         return
+
+    # ==================== AUTO HUNT ====================
+    if "Auto Hunt" in text:
+        if is_auto_hunt_enabled(chat_id):
+            stop_auto_hunt(chat_id)
+            bot.send_message(chat_id, "🛑 Auto Hunt остановлен.", reply_markup=main_keyboard(chat_id))
+        else:
+            toggle_auto_hunt(chat_id)
+            start_auto_hunt(chat_id)
+        return
+
+    # ==================== ГЕНЕРАЦИЯ ====================
+    if text == "🎲 12 слов":
+        mnemonic = mnemo.generate(strength=128)
+        record, address, _ = build_wallet_record(chat_id, mnemonic, "12 words")
+        bot.send_message(chat_id, f"✅ <b>12 слов сгенерировано</b>\n\n<code>{mnemonic}</code>\n\nАдрес: <code>{address}</code>", parse_mode="HTML", reply_markup=main_keyboard(chat_id))
+        add_history_records(chat_id, [record])
+
+    elif text == "🎲 24 слова":
+        mnemonic = mnemo.generate(strength=256)
+        record, address, _ = build_wallet_record(chat_id, mnemonic, "24 words")
+        bot.send_message(chat_id, f"✅ <b>24 слова сгенерировано</b>\n\n<code>{mnemonic}</code>\n\nАдрес: <code>{address}</code>", parse_mode="HTML", reply_markup=main_keyboard(chat_id))
+        add_history_records(chat_id, [record])
+
+    elif text in {"🎯 Рандом12 одинаковые", "🎯 Рандом24 одинаковые"}:
+        bot.send_message(chat_id, "🔄 Генерирую большой пакет...", reply_markup=main_keyboard(chat_id))
+        process_batch_private_keys(chat_id)
+
+    # ==================== ДРУГИЕ КНОПКИ ====================
+    elif text == "📤 Positive Found":
+        if POSITIVE_FOUND_FILE.exists() and POSITIVE_FOUND_FILE.stat().st_size > 0:
+            with POSITIVE_FOUND_FILE.open("rb") as f:
+                bot.send_document(chat_id, f, caption="Positive Found")
+        else:
+            bot.send_message(chat_id, "Пока нет находок.", reply_markup=main_keyboard(chat_id))
+
+    elif text.startswith("📊 Проверено"):
+        show_checked_counter(chat_id)
+
+    elif "public.txt" in text.lower():
+        bot.send_message(chat_id, "📤 Пришли мне файл public.txt для проверки", reply_markup=main_keyboard(chat_id))
+
+    else:
+        bot.send_message(chat_id, "✅ Кнопка нажата, но функция пока в разработке.\nИспользуй Auto Hunt или генерацию.", reply_markup=main_keyboard(chat_id))
 
     # ... (остальные обработчики кнопок)
 
@@ -755,10 +798,10 @@ def scan_uploaded_address_file(
     checked = 0
 
     indexed_addresses = list(enumerate(addresses, start=1))
-    chunks = chunks_by_size(indexed_addresses, cfg.get("public_scan_batch_size", 100))
+    chunks = chunks_by_size(indexed_addresses, cfg.get("public_scan_batch_size", 50))
 
     with ThreadPoolExecutor(max_workers=min(
-        cfg.get("public_scan_batch_workers", 64), 
+        cfg.get("public_scan_batch_workers", 34), 
         len(chunks) or 1
     )) as executor:
 
