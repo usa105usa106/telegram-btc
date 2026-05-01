@@ -602,7 +602,7 @@ def handle(message):
     if text in {"🏓 Ping", "ping"}:
         return send_ping(message.chat.id)
 
-    if text in {"🔥 Auto Hunt: ВКЛ", "🔥 Auto Hunt: ВЫКЛ", "autohunt"}:
+    if text in {"🔥 Auto Hunt: ВКЛ", "🔥 Auto Hunt: ВЫКЛ"}:
         if is_auto_hunt_enabled(message.chat.id):
             stop_auto_hunt(message.chat.id)
         else:
