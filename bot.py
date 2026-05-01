@@ -497,7 +497,7 @@ def public_scan_settings_keyboard() -> types.ReplyKeyboardMarkup:
 
 # ====================== BUILD RECORDS (упрощённые) ======================
 def build_private_key_record(chat_id: int, source_type: str, balance: str = "не проверялся"):
-    address, wif = generate_random_private_key_wallet()
+    private_key, address, wif = generate_random_private_key_wallet()
     record = {
         "a": address,
         "b": balance,
