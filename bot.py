@@ -879,6 +879,48 @@ def start_auto_hunt(chat_id: int):
     threading.Thread(target=auto_hunt_worker, args=(chat_id,), daemon=True).start()
 
 # ====================== ЗАПУСК ======================
+# ====================== ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ ======================
+
+def parse_balance_btc(balance_str: str) -> float:
+    """Преобразует '0.12345678 BTC' в число 0.12345678"""
+    try:
+        num_str = ''.join(c for c in balance_str if c.isdigit() or c in '.,')
+        num_str = num_str.replace(',', '.').strip()
+        return float(num_str)
+    except:
+        return 0.0
+
+
+def chat_has_pin(chat_id: int) -> bool:
+    """Проверяет, установлен ли PIN у чата"""
+    return str(chat_id) in pin_data
+
+
+def encrypt_json(data: dict) -> str:
+    """Простое шифрование данных (заглушка)"""
+    try:
+        import base64
+        return base64.b64encode(json.dumps(data).encode()).decode()
+    except:
+        return json.dumps(data)
+
+
+def remember_positive_wallet(chat_id: int, record: dict):
+    """Сохраняет найденный кошелёк в сессию"""
+    key = str(chat_id)
+    if key not in session_positive_wallets:
+        session_positive_wallets[key] = []
+    session_positive_wallets[key].append(record)
+
+
+def add_history_records(chat_id: int, records: list):
+    """Добавляет записи в историю (заглушка)"""
+    key = str(chat_id)
+    if key not in history:
+        history[key] = []
+    history[key].extend(records)
+    # save_history()  # можно раскомментировать позже
+
 if __name__ == "__main__":
     print(f"🤖 Bitcoin Wallet Hunter Bot v{BOT_VERSION} — ГОТОВ К РАБОТЕ")
     print(f"Data: {DATA_DIR}")
