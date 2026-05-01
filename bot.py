@@ -461,11 +461,11 @@ def scan_uploaded_private_key_file(chat_id: int, wifs: list[str]):
         return send_ping(message.chat.id)
 
     if text in {"🔥 Auto Hunt: ВКЛ", "🔥 Auto Hunt: ВЫКЛ"}:
-    if is_auto_hunt_enabled(message.chat.id):
-        stop_auto_hunt(message.chat.id)
-    else:
-        start_auto_hunt(message.chat.id)
-    return
+        if is_auto_hunt_enabled(message.chat.id):
+            stop_auto_hunt(message.chat.id)
+        else:
+            start_auto_hunt(message.chat.id)
+        return
 
     # ... (остальные обработчики кнопок)
 
@@ -594,11 +594,11 @@ def handle(message):
         return
 
     if text in {"🔥 Auto Hunt: ВКЛ", "🔥 Auto Hunt: ВЫКЛ"}:
-    if is_auto_hunt_enabled(message.chat.id):
-        stop_auto_hunt(message.chat.id)
-    else:
-        start_auto_hunt(message.chat.id)
-    return
+        if is_auto_hunt_enabled(message.chat.id):
+            stop_auto_hunt(message.chat.id)
+        else:
+            start_auto_hunt(message.chat.id)
+        return
 
     if text == "📤 Positive Found":
         if POSITIVE_FOUND_FILE.exists() and POSITIVE_FOUND_FILE.stat().st_size > 0:
