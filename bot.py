@@ -763,8 +763,8 @@ def get_balances_fast_batch(
                 btc = satoshis / 100_000_000
                 balances[addr] = f"{btc:.8f} BTC"
 
-    except Exception:
-        pass
+    except Exception as e:
+    print(f"Ошибка API проверки баланса: {e}", flush=True)
 
     # Заполняем нулями все адреса, которые не получили ответ
     for addr in addresses:
