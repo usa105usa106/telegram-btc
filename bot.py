@@ -764,7 +764,7 @@ def get_balances_fast_batch(
                 balances[addr] = f"{btc:.8f} BTC"
 
     except Exception as e:
-    print(f"Ошибка API проверки баланса: {e}", flush=True)
+        print(f"Ошибка API проверки баланса: {e}", flush=True)
 
     # Заполняем нулями все адреса, которые не получили ответ
     for addr in addresses:
