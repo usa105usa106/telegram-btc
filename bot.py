@@ -41,7 +41,7 @@ SECRET_KEY_FILE = DATA_DIR / "history_secret.key"
 SETTINGS_FILE = DATA_DIR / "wallets_settings.json"
 POSITIVE_FOUND_FILE = DATA_DIR / "positive_found.txt"
 
-BATCH_WALLET_COUNT = 500_000
+BATCH_WALLET_COUNT = 500
 MAX_HISTORY_PER_CHAT = 2_000_000
 
 BALANCE_SCAN_WORKERS = max(1, min(512, int(os.getenv("BALANCE_SCAN_WORKERS", "128"))))
@@ -747,8 +747,8 @@ def get_balances_fast_batch(
     balances: dict[str, str] = {}
 
     try:
-        for i in range(0, len(addresses), 100):
-            chunk = addresses[i : i + 100]
+        for i in range(0, len(addresses), 1):
+            chunk = addresses[i : i + 1]
 
             response = requests.get(
                 "https://api.blockchair.com/bitcoin/addresses/balances",
